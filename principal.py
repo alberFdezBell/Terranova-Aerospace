@@ -68,6 +68,7 @@ HASH_ITERATIONS = 240_000
 MODULES: dict[str, str | None] = {
     "Mapa orbital": "internal",
     "Notas de prensa": None,
+    "Lista de satélites": None,
     "Programación": None,
     "Centro de mando": None,
     "Personal": None,
@@ -798,6 +799,11 @@ if _KSP_AVAILABLE:
             self.timer = QTimer(self)
             self.timer.timeout.connect(self._update_orbits)
 
+            # Timer de animación: extrapola posiciones Keplerianas entre
+            # actualizaciones del servidor para lograr un movimiento fluido (~33 FPS).
+            self.animation_timer = QTimer(self)
+            self.animation_timer.timeout.connect(self._animate_satellites)
+
             self.vessels_to_update = []
             self.current_vessel_index = 0
 
@@ -864,6 +870,7 @@ if _KSP_AVAILABLE:
         def _build_ui(self):
             import os
             from PyQt6.QtGui import QPixmap
+            from PyQt6.QtWidgets import QSizePolicy, QLayout # <--- Añadido para controlar el tamaño
 
             # El mapa ocupa TODA la pantalla
             root_layout = QVBoxLayout(self)
@@ -895,9 +902,23 @@ if _KSP_AVAILABLE:
             # ── Overlay panel (sobre el mapa, esquina superior-izquierda) ──────
             self.overlay = PassthroughOverlay(self.view, self)
             self.overlay.setFixedWidth(260)
+
+            # Le damos un fondo oscuro, borde y esquinas redondeadas idénticas a tus otros paneles
+            self.overlay.setStyleSheet("""
+                PassthroughOverlay, QWidget {
+                    background: rgba(13, 17, 23, 180);
+                    border-radius: 8px;
+                }
+                QLineEdit, QFrame, QLabel, QPushButton {
+                    background: transparent; /* Evita que los hijos hereden el fondo de forma incorrecta */
+                }
+            """)
+
+            # Forzamos a que el layout ajuste el contenedor al tamaño mínimo de sus elementos (Logo + Buscador)
             overlay_layout = QVBoxLayout(self.overlay)
             overlay_layout.setContentsMargins(12, 14, 12, 14)
-            overlay_layout.setSpacing(8)
+            overlay_layout.setSpacing(10)
+            overlay_layout.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)
 
             # Logo
             logo_lbl = QLabel()
@@ -989,7 +1010,7 @@ if _KSP_AVAILABLE:
             self.info_panel.hide()
             overlay_layout.addWidget(self.info_panel)
 
-            overlay_layout.addStretch()
+            # overlay_layout.addStretch()  <--- ELIMINADO para evitar que empuje y expanda el menú
 
             # Dummy widgets para compatibilidad interna (no visibles)
             self.btn_connect    = QPushButton()
@@ -1254,12 +1275,14 @@ if _KSP_AVAILABLE:
             self._camera_fitted = False
             self._reload_data()
             self.timer.start(300)
+            self.animation_timer.start(30)
 
         def _on_connect_failed(self, err: str):
             pass  # Sin UI de estado visible
 
         def _disconnect(self):
             self.timer.stop()
+            self.animation_timer.stop()
             self._clear_all_vessels()
 
             if self.conn:
@@ -1272,6 +1295,8 @@ if _KSP_AVAILABLE:
             self._camera_fitted = False
 
         def _clear_all_vessels(self):
+            if hasattr(self, 'animation_timer'):
+                self.animation_timer.stop()
             for vid, obj in self.render_objects.items():
                 for key in ('line', 'dot', 'trail_line'):
                     if key in obj and obj[key] is not None:
@@ -1300,6 +1325,7 @@ if _KSP_AVAILABLE:
 
         def _on_back_clicked(self):
             self.timer.stop()
+            self.animation_timer.stop()
             self.back_clicked.emit()
 
         def _set_selected_vessel(self, vessel_name: str):
@@ -1677,12 +1703,35 @@ if _KSP_AVAILABLE:
                                 'info_data': info_data,
                                 'color_idx': cidx,
                                 'ordered_trail': trail_buf.copy(),
+                                'R_matrix': R,
+                                'r_orbit': r_orbit,
+                                'ecc': ecc,
+                                'period': period,
+                                'true_anomaly_base': true_anom,
+                                'last_update_time': time.time(),
                             }
                         else:
                             obj = self.render_objects[vid]
+                            now_t = time.time()
+                            resolved_anom = self._resolve_server_anomaly(obj, true_anom, ecc, period, now_t)
+                            if resolved_anom != true_anom:
+                                r_now2 = r_orbit * (1 - ecc**2) / (1 + ecc * np.cos(resolved_anom))
+                                pos_now2 = (R @ np.array([
+                                    r_now2 * np.cos(resolved_anom),
+                                    r_now2 * np.sin(resolved_anom),
+                                    0.0
+                                ]))
+                                sx, sy, sz = float(pos_now2[0]), float(pos_now2[1]), float(pos_now2[2])
+
                             obj['orbit_pts'] = rotated
                             obj['pos_3d'] = (sx, sy, sz)
                             obj['info_data'] = info_data
+                            obj['R_matrix'] = R
+                            obj['r_orbit'] = r_orbit
+                            obj['ecc'] = ecc
+                            obj['period'] = period
+                            obj['true_anomaly_base'] = resolved_anom
+                            obj['last_update_time'] = now_t
 
                             buf = obj['trail_buf']
                             head = obj['trail_head']
@@ -1890,9 +1939,26 @@ if _KSP_AVAILABLE:
                 }
 
                 obj = self.render_objects[vid]
+                now_t = time.time()
+                resolved_anom = self._resolve_server_anomaly(obj, true_anom, ecc, period, now_t)
+                if resolved_anom != true_anom:
+                    r_now2 = r_orbit * (1 - ecc**2) / (1 + ecc * np.cos(resolved_anom))
+                    pos_now2 = (R @ np.array([
+                        r_now2 * np.cos(resolved_anom),
+                        r_now2 * np.sin(resolved_anom),
+                        0.0
+                    ]))
+                    sx, sy, sz = float(pos_now2[0]), float(pos_now2[1]), float(pos_now2[2])
+
                 obj['orbit_pts'] = rotated
                 obj['pos_3d'] = (sx, sy, sz)
                 obj['info_data'] = info_data
+                obj['R_matrix'] = R
+                obj['r_orbit'] = r_orbit
+                obj['ecc'] = ecc
+                obj['period'] = period
+                obj['true_anomaly_base'] = resolved_anom
+                obj['last_update_time'] = now_t
 
                 buf = obj['trail_buf']
                 head = obj['trail_head']
@@ -1917,6 +1983,128 @@ if _KSP_AVAILABLE:
 
             except Exception as e:
                 self._handle_update_error(e)
+
+        def _propagate_true_anomaly(self, ecc, period, ta_base, dt):
+            """Devuelve la anomalía verdadera tras `dt` segundos a partir de
+            `ta_base`, usando movimiento medio Kepleriano. Reutilizado tanto
+            por la animación de cada frame como por la corrección anti-salto
+            cuando llega un dato real del servidor."""
+            if dt < 0:
+                dt = 0.0
+            n = 2.0 * math.pi / period  # movimiento medio (rad/s)
+
+            if ecc < 0.999:
+                E0 = 2.0 * math.atan2(
+                    math.sqrt(max(0.0, 1 - ecc)) * math.sin(ta_base / 2.0),
+                    math.sqrt(max(1e-12, 1 + ecc)) * math.cos(ta_base / 2.0)
+                )
+                M0 = E0 - ecc * math.sin(E0)
+                M = M0 + n * dt
+                M = math.fmod(M, 2.0 * math.pi)
+
+                # Resolver la ecuación de Kepler M = E - e*sin(E) (Newton-Raphson)
+                E = M
+                for _ in range(6):
+                    f = E - ecc * math.sin(E) - M
+                    fp = 1.0 - ecc * math.cos(E)
+                    if abs(fp) < 1e-12:
+                        break
+                    E = E - f / fp
+
+                return 2.0 * math.atan2(
+                    math.sqrt(max(0.0, 1 + ecc)) * math.sin(E / 2.0),
+                    math.sqrt(max(1e-12, 1 - ecc)) * math.cos(E / 2.0)
+                )
+            else:
+                # Órbitas hiperbólicas / parabólicas: extrapolación lineal simple
+                return ta_base + n * dt
+
+        def _resolve_server_anomaly(self, obj, true_anom, ecc, period, now_t):
+            """Concilia el dato real recibido del servidor con la posición ya
+            extrapolada localmente, evitando que el satélite 'retroceda'
+            visualmente por jitter o latencia de los streams de krpc.
+
+            Si el dato del servidor queda por detrás de donde ya habíamos
+            extrapolado (caso típico: la llamada al stream tarda unos ms y
+            trae un estado ligeramente más antiguo que 'ahora'), se conserva
+            la posición ya extrapolada y se sigue avanzando desde ahí. Si el
+            servidor va por delante (p. ej. tras una maniobra real), se
+            adopta directamente el nuevo valor.
+            """
+            prev_ta_base = obj.get('true_anomaly_base')
+            prev_t0 = obj.get('last_update_time')
+            prev_ecc = obj.get('ecc')
+            prev_period = obj.get('period')
+
+            if prev_ta_base is None or prev_t0 is None or not prev_period:
+                return true_anom
+
+            try:
+                dt_prev = now_t - prev_t0
+                predicted = self._propagate_true_anomaly(
+                    prev_ecc if prev_ecc is not None else ecc,
+                    prev_period, prev_ta_base, dt_prev
+                )
+                diff = math.atan2(
+                    math.sin(true_anom - predicted),
+                    math.cos(true_anom - predicted)
+                )
+                # diff < 0  => el dato del servidor va "por detrás" de lo ya
+                # mostrado: ignoramos el retroceso y mantenemos la posición
+                # extrapolada para no producir un salto hacia atrás visible.
+                if diff < 0:
+                    return predicted
+                return true_anom
+            except Exception:
+                return true_anom
+
+        def _animate_satellites(self):
+            """Extrapola la posición de cada satélite a partir de su última
+            actualización real usando física Kepleriana (movimiento medio),
+            de forma que el movimiento se vea continuo y fluido a ~33 FPS,
+            sin importar cuántos satélites haya ni el orden en que el
+            servidor los vaya actualizando."""
+            if not self.render_objects:
+                return
+
+            now = time.time()
+            selected = self.selected_vessel
+
+            for vid, obj in self.render_objects.items():
+                try:
+                    R = obj.get('R_matrix')
+                    r_orbit = obj.get('r_orbit')
+                    ecc = obj.get('ecc')
+                    period = obj.get('period')
+                    ta_base = obj.get('true_anomaly_base')
+                    t0 = obj.get('last_update_time')
+
+                    if (R is None or r_orbit is None or ecc is None
+                            or not period or ta_base is None or t0 is None):
+                        continue
+
+                    dt = now - t0
+                    true_anom = self._propagate_true_anomaly(ecc, period, ta_base, dt)
+
+                    r_now = r_orbit * (1 - ecc ** 2) / (1 + ecc * math.cos(true_anom))
+                    x_now = r_now * math.cos(true_anom)
+                    y_now = r_now * math.sin(true_anom)
+                    pos_now = R @ np.array([x_now, y_now, 0.0])
+                    sx, sy, sz = float(pos_now[0]), float(pos_now[1]), float(pos_now[2])
+
+                    obj['pos_3d'] = (sx, sy, sz)
+
+                    show_in_map = selected is None or selected == vid
+                    dot = obj.get('dot')
+                    if dot is not None and show_in_map:
+                        dot.setData(pos=np.array([[sx, sy, sz]], dtype=np.float32))
+
+                except Exception:
+                    continue
+
+            # Seguimiento de cámara fluido sobre el satélite seleccionado
+            if selected is not None and selected in self.render_objects:
+                self._focus_camera_on(selected, initial=False)
 
         def _handle_update_error(self, e):
             self.timer.stop()
