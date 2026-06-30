@@ -19,6 +19,10 @@ import sys
 import time
 from pathlib import Path
 
+from PyQt6.QtCore import QPointF
+from PyQt6.QtGui import QMouseEvent
+from PySide6.QtCore import QVariantAnimation
+
 from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, QRect, QSize, Qt, QTimer, QThread, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter, QPen, QPixmap, QPalette, QFont, QCursor, QVector3D
 from PyQt6.QtWidgets import (
@@ -574,6 +578,114 @@ if _KSP_AVAILABLE:
         thread.start()
         return thread
 
+    class PassthroughOverlay(QWidget):
+        """Overlay transparente que reenvía eventos de mouse al GLViewWidget
+        cuando el cursor no está encima de ningún widget hijo interactivo."""
+
+        def __init__(self, view_widget, parent=None):
+            super().__init__(parent)
+            self._view = view_widget
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        def _hit_interactive_child(self, pos):
+            """Devuelve True si pos (en coords del overlay) cae sobre un hijo interactivo."""
+            child = self.childAt(pos)
+            if child is None:
+                return False
+            # Recorrer la jerarquía hasta el overlay; si alguno es interactivo → True
+            w = child
+            while w is not None and w is not self:
+                if isinstance(w, (QLineEdit, QPushButton, QFrame, QScrollArea)):
+                    # QFrame incluye info_panel; solo bloqueamos si es visible
+                    if isinstance(w, QFrame) and not w.isVisible():
+                        w = w.parentWidget()
+                        continue
+                    return True
+                w = w.parentWidget()
+            return False
+
+        def _forward_to_view(self, event):
+            """Transforma el evento a coordenadas del view y lo envía."""
+            from PyQt6.QtCore import QPointF
+            global_pos = self.mapToGlobal(event.position().toPoint())
+            view_pos = self._view.mapFromGlobal(global_pos)
+            # Crear un evento sintético equivalente no es trivial en PyQt6;
+            # en su lugar llamamos directamente al handler personalizado del visualizador.
+            return view_pos
+
+        def mousePressEvent(self, event):
+            if not self._hit_interactive_child(event.position().toPoint()):
+                # Crear evento equivalente en el view y llamar al handler
+                from PyQt6.QtGui import QMouseEvent
+                global_pos = self.mapToGlobal(event.position().toPoint())
+                view_local = self._view.mapFromGlobal(global_pos)
+                new_event = QMouseEvent(
+                    event.type(),
+                    QPointF(view_local),
+                    event.globalPosition(),
+                    event.button(),
+                    event.buttons(),
+                    event.modifiers(),
+                )
+                self._view.mousePressEvent(new_event)
+                return
+            super().mousePressEvent(event)
+
+        def mouseReleaseEvent(self, event):
+            if not self._hit_interactive_child(event.position().toPoint()):
+                from PyQt6.QtGui import QMouseEvent
+                global_pos = self.mapToGlobal(event.position().toPoint())
+                view_local = self._view.mapFromGlobal(global_pos)
+                new_event = QMouseEvent(
+                    event.type(),
+                    QPointF(view_local),
+                    event.globalPosition(),
+                    event.button(),
+                    event.buttons(),
+                    event.modifiers(),
+                )
+                self._view.mouseReleaseEvent(new_event)
+                return
+            super().mouseReleaseEvent(event)
+
+        def mouseMoveEvent(self, event):
+            if not self._hit_interactive_child(event.position().toPoint()):
+                from PyQt6.QtCore import QPointF
+                from PyQt6.QtGui import QMouseEvent
+                global_pos = self.mapToGlobal(event.position().toPoint())
+                view_local = self._view.mapFromGlobal(global_pos)
+                new_event = QMouseEvent(
+                    event.type(),
+                    QPointF(view_local),
+                    event.globalPosition(),
+                    event.button(),
+                    event.buttons(),
+                    event.modifiers(),
+                )
+                self._view.mouseMoveEvent(new_event)
+                return
+            super().mouseMoveEvent(event)
+
+        def wheelEvent(self, event):
+            if not self._hit_interactive_child(event.position().toPoint()):
+                from PyQt6.QtCore import QPointF
+                from PyQt6.QtGui import QWheelEvent
+                global_pos = self.mapToGlobal(event.position().toPoint())
+                view_local = self._view.mapFromGlobal(global_pos)
+                new_event = QWheelEvent(
+                    QPointF(view_local),
+                    event.globalPosition(),
+                    event.pixelDelta(),
+                    event.angleDelta(),
+                    event.buttons(),
+                    event.modifiers(),
+                    event.phase(),
+                    event.inverted(),
+                )
+                self._view.wheelEvent(new_event)
+                return
+            super().wheelEvent(event)
+
     class VesselInfoCard(QFrame):
         clicked = pyqtSignal(str)
 
@@ -678,6 +790,7 @@ if _KSP_AVAILABLE:
             self.last_mouse_pos = None
             self.is_rotating = False
             self._press_pos = None
+            self._press_vessel = None
 
             self._build_ui()
             self._init_static_scene()
@@ -777,9 +890,8 @@ if _KSP_AVAILABLE:
             self.info_bubble.hide()
 
             # ── Overlay panel (sobre el mapa, esquina superior-izquierda) ──────
-            self.overlay = QWidget(self)
+            self.overlay = PassthroughOverlay(self.view, self)
             self.overlay.setFixedWidth(260)
-            self.overlay.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
             overlay_layout = QVBoxLayout(self.overlay)
             overlay_layout.setContentsMargins(12, 14, 12, 14)
             overlay_layout.setSpacing(8)
@@ -1085,7 +1197,7 @@ if _KSP_AVAILABLE:
                 f"<span style='color:{c_key}'>Excentricidad</span>  "
                 f"<span style='color:{c_val}'>{ecc:.4f}</span><br>"
                 f"<span style='color:{c_key}'>Velocidad</span>  "
-                f"<span style='color:{c_val}'>{vel_ms:,.0f} m/s</span>"
+                f"<span style='color:{c_val}'>{vel_ms:.0f} m/s</span>"
             )
 
         def _deselect_vessel(self):
@@ -1294,6 +1406,8 @@ if _KSP_AVAILABLE:
             # Detectar si hay un satélite bajo el cursor
             has_hover = self.hovered_vessel is not None and self.selected_vessel is None
 
+            highlighted_items = []
+
             for vid, obj in self.render_objects.items():
                 is_selected = self.selected_vessel == vid
                 is_hovered = self.hovered_vessel == vid
@@ -1307,30 +1421,37 @@ if _KSP_AVAILABLE:
                 if has_hover:
                     if is_hovered:
                         line_color = obj.get('base_line_color', ORBIT_LINE_COLOR)
+                        line_width = 3.5
                         dot_color = obj.get('base_dot_color')
                         trail_visible = True
                     else:
-                        line_color = (0.05, 0.2, 0.25, 0.15)  # Cian atenuado con baja opacidad
+                        line_color = (0.02, 0.07, 0.09, 0.08)  # Muy atenuado para no competir con la orbita resaltada
+                        line_width = 1.0
                         base_dot = obj.get('base_dot_color')
                         if base_dot is not None:
-                            dot_color = (base_dot[0]*0.2, base_dot[1]*0.2, base_dot[2]*0.2, 0.25)
+                            dot_color = (base_dot[0]*0.16, base_dot[1]*0.16, base_dot[2]*0.16, 0.2)
                         else:
-                            dot_color = (0.2, 0.2, 0.2, 0.2)
+                            dot_color = (0.16, 0.16, 0.16, 0.2)
                         trail_visible = False  # Ocultar rastro para limpiar la escena
                 else:
                     line_color = obj.get('base_line_color', ORBIT_LINE_COLOR)
+                    line_width = 3.5 if is_selected else 1.5
                     dot_color = obj.get('base_dot_color')
                     trail_visible = show_in_map
 
                 if line is not None:
                     line.setVisible(show_in_map)
                     if show_in_map and line_color is not None:
-                        line.setData(pos=obj['orbit_pts'], color=line_color)
+                        line.setData(pos=obj['orbit_pts'], color=line_color, width=line_width)
+                        if is_hovered or is_selected:
+                            highlighted_items.append(line)
 
                 if dot is not None:
                     dot.setVisible(show_in_map)
                     if show_in_map and dot_color is not None:
                         dot.setData(pos=np.array([obj['pos_3d']], dtype=np.float32), color=dot_color)
+                        if is_hovered or is_selected:
+                            highlighted_items.append(dot)
 
                 if trail is not None:
                     trail.setVisible(trail_visible)
@@ -1339,6 +1460,17 @@ if _KSP_AVAILABLE:
                         ordered = obj.get('ordered_trail')
                         if trail_colors is not None and ordered is not None:
                             trail.setData(pos=ordered, color=trail_colors)
+                        if is_hovered or is_selected:
+                            highlighted_items.append(trail)
+
+            # PyQtGraph pinta los GL items en orden de insercion; reinsertar el destacado
+            # evita que una orbita atenuada de la misma trayectoria se mezcle por encima.
+            for item in highlighted_items:
+                try:
+                    self.view.removeItem(item)
+                    self.view.addItem(item)
+                except Exception:
+                    pass
 
         def _apply_filter(self, text: str):
             self.active_filter_text = (text or "").strip().lower()
@@ -1620,11 +1752,11 @@ if _KSP_AVAILABLE:
         def _mouse_press(self, event):
             if event.button() == Qt.MouseButton.LeftButton:
                 hit = self._vessel_at_cursor(event)
+                self._press_pos = event.position()
+                self._press_vessel = hit[0] if hit is not None else None
+                self.is_rotating = True
+                self.last_mouse_pos = event.position()
                 if hit is not None:
-                    vid, px, py = hit
-                    self._select_vessel(vid)
-                    self.is_rotating = False
-                    self._press_pos = None   # no deseleccionar en release
                     return
                 # Guardar posición del press para distinguir click de drag
                 self._press_pos = event.position()
@@ -1635,11 +1767,23 @@ if _KSP_AVAILABLE:
             if event.button() == Qt.MouseButton.LeftButton:
                 self.is_rotating = False
                 # Solo deseleccionar si fue un click puro (sin arrastre)
-                if self._press_pos is not None and self.selected_vessel is not None:
+                if self._press_pos is not None:
                     delta = event.position() - self._press_pos
-                    if (delta.x() ** 2 + delta.y() ** 2) < 16:  # < 4px de movimiento
+                    is_click = (delta.x() ** 2 + delta.y() ** 2) < 16  # < 4px de movimiento
+                    release_hit = self._vessel_at_cursor(event)
+
+                    if (
+                        is_click and
+                        self._press_vessel is not None and
+                        release_hit is not None and
+                        release_hit[0] == self._press_vessel
+                    ):
+                        self._select_vessel(self._press_vessel)
+                    elif is_click and self._press_vessel is None and self.selected_vessel is not None:
                         self._deselect_vessel()
                 self._press_pos = None
+                self._press_vessel = None
+                self.last_mouse_pos = None
 
         def _wheel_event(self, event):
             delta = event.angleDelta().y()
