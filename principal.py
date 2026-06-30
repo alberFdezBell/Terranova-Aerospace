@@ -995,6 +995,41 @@ if _KSP_AVAILABLE:
             # Zoom y seguimiento de cámara inicial (reinicia ángulos y zoom)
             self._focus_camera_on(vessel_name, initial=True)
 
+        def _animate_camera_to(self, target_pos, target_dist, target_azim, target_elev, duration=900):
+            from PyQt6.QtCore import QVariantAnimation, QEasingCurve
+            
+            if hasattr(self, '_camera_anim_obj') and self._camera_anim_obj is not None:
+                self._camera_anim_obj.stop()
+                
+            start_pos = self.view.opts['center']
+            start_dist = self.view.opts['distance']
+            start_azim = self.view.opts['azimuth']
+            start_elev = self.view.opts['elevation']
+            
+            if not isinstance(start_pos, QVector3D):
+                start_pos = QVector3D(0, 0, 0)
+                
+            anim = QVariantAnimation(self)
+            anim.setDuration(duration)
+            anim.setStartValue(0.0)
+            anim.setEndValue(1.0)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            
+            azim_diff = target_azim - start_azim
+            azim_diff = (azim_diff + 180) % 360 - 180
+            
+            def update_cam(t_val):
+                curr_pos = start_pos + (target_pos - start_pos) * t_val
+                curr_dist = start_dist + (target_dist - start_dist) * t_val
+                curr_azim = start_azim + azim_diff * t_val
+                curr_elev = start_elev + (target_elev - start_elev) * t_val
+                self.view.setCameraPosition(pos=curr_pos, distance=curr_dist, azimuth=curr_azim, elevation=curr_elev)
+                self.view.update()
+                
+            anim.valueChanged.connect(update_cam)
+            self._camera_anim_obj = anim
+            anim.start()
+
         def _focus_camera_on(self, vessel_name: str, initial: bool = False):
             """Centra la cámara en el satélite seleccionado. Preserva zoom y rotación a menos que initial=True."""
             obj = self.render_objects.get(vessel_name)
@@ -1008,10 +1043,16 @@ if _KSP_AVAILABLE:
                 # Calcular azimut y elevación para apuntar a la posición
                 azim = math.degrees(math.atan2(sy, sx))
                 elev = math.degrees(math.atan2(sz, math.hypot(sx, sy)))
-                self.view.setCameraPosition(pos=pos, distance=dist, azimuth=azim, elevation=elev)
+                self._animate_camera_to(pos, dist, azim, elev, duration=900)
             else:
-                self.view.setCameraPosition(pos=pos)
-            self.view.update()
+                anim_running = (
+                    hasattr(self, '_camera_anim_obj') and 
+                    self._camera_anim_obj is not None and 
+                    self._camera_anim_obj.state() == QVariantAnimation.State.Running
+                )
+                if not anim_running:
+                    self.view.setCameraPosition(pos=pos)
+                    self.view.update()
 
         def _update_info_panel(self, vessel_name: str):
             """Rellena el panel con los datos del satélite en texto limpio."""
@@ -1048,13 +1089,12 @@ if _KSP_AVAILABLE:
             )
 
         def _deselect_vessel(self):
-            """Cierra el panel de info y restaura la vista general."""
+            """Cierra el panel de info y restaura la vista general fluidamente."""
             self.selected_vessel = None
             self.info_panel.hide()
             self._hide_info_bubble()
             self._update_selection_visuals()
-            self.view.setCameraPosition(pos=QVector3D(0, 0, 0), distance=5200, elevation=22, azimuth=-45)
-            self.view.update()
+            self._animate_camera_to(QVector3D(0, 0, 0), 5200.0, -45.0, 22.0, duration=900)
 
         def _init_static_scene(self):
             md = gl.MeshData.sphere(rows=30, cols=48, radius=PLANET_DRAW_RADIUS)
@@ -1098,7 +1138,7 @@ if _KSP_AVAILABLE:
             self.conn = conn
             self._camera_fitted = False
             self._reload_data()
-            self.timer.start(1000)
+            self.timer.start(3000)
 
         def _on_connect_failed(self, err: str):
             pass  # Sin UI de estado visible
@@ -1158,7 +1198,8 @@ if _KSP_AVAILABLE:
                 return None
 
             try:
-                proj = self.view.projectionMatrix()
+                r = self.view.getViewport()
+                proj = self.view.projectionMatrix(r, r)
                 view = self.view.viewMatrix()
             except Exception:
                 return None
@@ -1216,7 +1257,6 @@ if _KSP_AVAILABLE:
 
         def _format_info_bubble(self, vessel_name: str) -> str:
             obj = self.render_objects.get(vessel_name, {})
-            info = obj.get('info_data', {})
             cidx = obj.get('color_idx', 0)
             color = DOT_COLORS[cidx % len(DOT_COLORS)]
             color_hex = "#{:02X}{:02X}{:02X}".format(
@@ -1224,14 +1264,7 @@ if _KSP_AVAILABLE:
                 int(color[1] * 255),
                 int(color[2] * 255)
             )
-            return (
-                f"<b style='color:{color_hex}'>🛰 {vessel_name}</b><br>"
-                f"<span style='color:#8b949e'>Altitud:</span> {info.get('alt_km', 0):,.0f} km<br>"
-                f"<span style='color:#8b949e'>Periodo:</span> {VesselInfoCard._fmt_time(info.get('period', 0))}<br>"
-                f"<span style='color:#8b949e'>Inclinación:</span> {math.degrees(info.get('inc', 0)):.2f}°<br>"
-                f"<span style='color:#8b949e'>Excentricidad:</span> {info.get('ecc', 0):.4f}<br>"
-                f"<span style='color:#8b949e'>Velocidad:</span> {info.get('vel_ms', 0):.0f} m/s"
-            )
+            return f"<b style='color:{color_hex}'>🛰 {vessel_name}</b>"
 
         def _show_info_bubble(self, vessel_name: str, px: float, py: float):
             if self.info_bubble is None:
@@ -1258,34 +1291,54 @@ if _KSP_AVAILABLE:
             if self.selected_vessel is not None and self.selected_vessel not in self.render_objects:
                 self.selected_vessel = None
 
+            # Detectar si hay un satélite bajo el cursor
+            has_hover = self.hovered_vessel is not None and self.selected_vessel is None
+
             for vid, obj in self.render_objects.items():
                 is_selected = self.selected_vessel == vid
+                is_hovered = self.hovered_vessel == vid
                 show_in_map = self.selected_vessel is None or is_selected
 
                 line = obj.get('line')
                 dot = obj.get('dot')
                 trail = obj.get('trail_line')
 
+                # Calcular colores según hover y selección
+                if has_hover:
+                    if is_hovered:
+                        line_color = obj.get('base_line_color', ORBIT_LINE_COLOR)
+                        dot_color = obj.get('base_dot_color')
+                        trail_visible = True
+                    else:
+                        line_color = (0.05, 0.2, 0.25, 0.15)  # Cian atenuado con baja opacidad
+                        base_dot = obj.get('base_dot_color')
+                        if base_dot is not None:
+                            dot_color = (base_dot[0]*0.2, base_dot[1]*0.2, base_dot[2]*0.2, 0.25)
+                        else:
+                            dot_color = (0.2, 0.2, 0.2, 0.2)
+                        trail_visible = False  # Ocultar rastro para limpiar la escena
+                else:
+                    line_color = obj.get('base_line_color', ORBIT_LINE_COLOR)
+                    dot_color = obj.get('base_dot_color')
+                    trail_visible = show_in_map
+
                 if line is not None:
                     line.setVisible(show_in_map)
-                    if show_in_map:
-                        base = obj.get('base_line_color')
-                        if base is not None:
-                            line.setData(pos=obj['orbit_pts'], color=base)
+                    if show_in_map and line_color is not None:
+                        line.setData(pos=obj['orbit_pts'], color=line_color)
 
                 if dot is not None:
                     dot.setVisible(show_in_map)
-                    if show_in_map:
-                        base = obj.get('base_dot_color')
-                        if base is not None:
-                            dot.setData(pos=np.array([obj['pos_3d']], dtype=np.float32), color=base)
+                    if show_in_map and dot_color is not None:
+                        dot.setData(pos=np.array([obj['pos_3d']], dtype=np.float32), color=dot_color)
 
                 if trail is not None:
-                    trail.setVisible(show_in_map)
-                    trail_colors = obj.get('trail_colors')
-                    if show_in_map and trail_colors is not None:
-                        colors = trail_colors.copy()
-                        trail.setData(pos=obj['trail_buf'], color=colors)
+                    trail.setVisible(trail_visible)
+                    if trail_visible:
+                        trail_colors = obj.get('trail_colors')
+                        ordered = obj.get('ordered_trail')
+                        if trail_colors is not None and ordered is not None:
+                            trail.setData(pos=ordered, color=trail_colors)
 
         def _apply_filter(self, text: str):
             self.active_filter_text = (text or "").strip().lower()
@@ -1307,15 +1360,20 @@ if _KSP_AVAILABLE:
                 return
 
             for obj in self.render_objects.values():
-                if 'trail_buf' in obj and obj['trail_buf'] is not None:
-                    obj['trail_buf'][:] = 0
+                if 'trail_buf' in obj and obj['trail_buf'] is not None and 'pos_3d' in obj:
+                    sx, sy, sz = obj['pos_3d']
+                    obj['trail_buf'][:, 0] = sx
+                    obj['trail_buf'][:, 1] = sy
+                    obj['trail_buf'][:, 2] = sz
+                    obj['ordered_trail'] = obj['trail_buf'].copy()
                 obj['trail_head'] = 0
                 obj['trail_filled'] = False
                 if obj.get('trail_line') is not None:
                     trail_colors = obj.get('trail_colors')
-                    if trail_colors is not None:
+                    ordered = obj.get('ordered_trail')
+                    if trail_colors is not None and ordered is not None:
                         obj['trail_line'].setData(
-                            pos=np.zeros((1, 3), dtype=np.float32),
+                            pos=ordered[:1],
                             color=trail_colors[:1]
                         )
 
@@ -1449,7 +1507,12 @@ if _KSP_AVAILABLE:
                                 color=dc, size=8, pxMode=True, glOptions='opaque'
                             )
 
-                            trail_buf = np.zeros((TRAIL_LEN, 3), dtype=np.float32)
+                            # Inicializar el buffer de rastro con la posición inicial del satélite (evita líneas al origen)
+                            trail_buf = np.empty((TRAIL_LEN, 3), dtype=np.float32)
+                            trail_buf[:, 0] = sx
+                            trail_buf[:, 1] = sy
+                            trail_buf[:, 2] = sz
+
                             trail_alphas = np.linspace(0.0, 1.0, TRAIL_LEN)
                             trail_colors = np.zeros((TRAIL_LEN, 4), dtype=np.float32)
                             trail_colors[:, 0] = lc[0]
@@ -1480,12 +1543,11 @@ if _KSP_AVAILABLE:
                                 'pos_3d': (sx, sy, sz),
                                 'info_data': info_data,
                                 'color_idx': cidx,
+                                'ordered_trail': trail_buf.copy(),
                             }
                         else:
                             obj = self.render_objects[vid]
                             obj['orbit_pts'] = rotated
-                            obj['line'].setData(pos=rotated, color=obj['base_line_color'])
-                            obj['dot'].setData(pos=np.array([[sx, sy, sz]], dtype=np.float32), color=obj['base_dot_color'])
                             obj['pos_3d'] = (sx, sy, sz)
                             obj['info_data'] = info_data
 
@@ -1500,11 +1562,10 @@ if _KSP_AVAILABLE:
                                 idx = obj['trail_head']
                                 ordered = np.roll(buf, -idx, axis=0)
                             else:
-                                ordered = buf[:head + 1]
+                                # Solo usar los slots que han sido escritos, el resto queda en la posición inicial del satélite (sin línea al origen)
+                                ordered = buf[:head + 1] if head > 0 else buf[:1]
 
-                            if len(ordered) > 1:
-                                tc = obj['trail_colors'][:len(ordered)]
-                                obj['trail_line'].setData(pos=ordered, color=tc)
+                            obj['ordered_trail'] = ordered
 
                             # Actualizar panel de info si este satélite está seleccionado
                             if self.selected_vessel == vid:
@@ -1542,6 +1603,9 @@ if _KSP_AVAILABLE:
                                 except Exception:
                                     pass
                             del self.vessel_streams[vid]
+
+                # Aplicar colores y visibilidad correctos (respeta hover y selección)
+                self._update_selection_visuals()
 
             except Exception as e:
                 self.timer.stop()
@@ -1595,24 +1659,26 @@ if _KSP_AVAILABLE:
                 new_elev = max(-89.0, min(89.0, new_elev))
                 self.view.setCameraPosition(azimuth=new_azim, elevation=new_elev)
                 self.view.update()
-                if self.info_bubble_locked and self.selected_vessel is not None:
-                    projected = self._project_vessel(self.selected_vessel)
-                    if projected is not None:
-                        self._show_info_bubble(self.selected_vessel, projected[0], projected[1])
-                return
-
-            if self.info_bubble_locked:
                 return
 
             hit = self._vessel_at_cursor(event)
             if hit is not None:
                 vid, px, py = hit
-                self.hovered_vessel = vid
-                self._show_info_bubble(vid, px, py)
+                if self.hovered_vessel != vid:
+                    self.hovered_vessel = vid
+                    self._show_info_bubble(vid, event.position().x(), event.position().y())
+                    self._update_selection_visuals()
+                else:
+                    self._show_info_bubble(vid, event.position().x(), event.position().y())
             else:
-                if self.info_bubble is not None:
-                    self.info_bubble.hide()
-                self.hovered_vessel = None
+                if self.hovered_vessel is not None:
+                    self.hovered_vessel = None
+                    if self.info_bubble is not None:
+                        self.info_bubble.hide()
+                    self._update_selection_visuals()
+                else:
+                    if self.info_bubble is not None:
+                        self.info_bubble.hide()
 
         def resizeEvent(self, event):
             super().resizeEvent(event)
