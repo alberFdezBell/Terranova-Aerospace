@@ -636,7 +636,7 @@ if _KSP_AVAILABLE:
             _set(self.lbl_period, "Período",     self._fmt_time(period_s))
             _set(self.lbl_inc,    "Inclinación", f"{math.degrees(inc_deg):.2f}°")
             _set(self.lbl_ecc,    "Excentr.",    f"{ecc:.4f}")
-            _set(self.lbl_vel,    "Velocidad",   f"{vel_ms:,.0f} m/s")
+            _set(self.lbl_vel,    "Velocidad",   f"{vel_ms:.0f} m/s")
 
         def mousePressEvent(self, event):
             if event.button() == Qt.MouseButton.LeftButton:
@@ -677,6 +677,7 @@ if _KSP_AVAILABLE:
 
             self.last_mouse_pos = None
             self.is_rotating = False
+            self._press_pos = None
 
             self._build_ui()
             self._init_static_scene()
@@ -693,7 +694,7 @@ if _KSP_AVAILABLE:
         def _apply_dark_theme(self):
             self.setStyleSheet("""
                 QWidget {
-                    background: #0d1117;
+                    background: transparent;
                     color: #c9d1d9;
                     font-family: 'Segoe UI', 'SF Pro Display', sans-serif;
                 }
@@ -709,157 +710,58 @@ if _KSP_AVAILABLE:
                 QPushButton:pressed { background: #161b22; }
                 QPushButton:disabled { color: #484f58; }
                 QPushButton#btnBack {
-                    background: transparent;
-                    border: none;
+                    background: rgba(13,17,23,200);
+                    border: 1px solid #30363d;
                     color: #c9d1d9;
-                    font-size: 14px;
+                    font-size: 13px;
                     font-weight: bold;
-                    text-decoration: none;
-                    padding: 0px;
+                    border-radius: 6px;
+                    padding: 6px 14px;
                 }
                 QPushButton#btnBack:hover {
-                    background: transparent;
-                    border: none;
+                    background: rgba(30,40,55,220);
+                    border-color: #58a6ff;
                     color: #58a6ff;
-                    text-decoration: underline;
                 }
                 QPushButton#btnBack:pressed {
-                    background: transparent;
+                    background: rgba(13,17,23,240);
                     color: #1f6feb;
                 }
-                QLabel { color: #8b949e; }
-                QScrollArea { border: none; background: transparent; }
+                QLineEdit {
+                    background: rgba(13,17,23,210);
+                    color: #c9d1d9;
+                    border: 1px solid #30363d;
+                    border-radius: 6px;
+                    padding: 7px 10px;
+                    font-size: 12px;
+                }
+                QLineEdit:focus { border-color: #58a6ff; }
                 QScrollBar:vertical {
-                    background: #161b22; width: 6px; border-radius: 3px;
+                    background: rgba(22,27,34,180); width: 5px; border-radius: 3px;
                 }
                 QScrollBar::handle:vertical {
                     background: #30363d; border-radius: 3px;
                 }
+                QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
             """)
 
         def _build_ui(self):
             import os
-            from PyQt6.QtGui import QPixmap  # Asegúrate de tener esta importación en tu archivo
-            
-            root_layout = QHBoxLayout(self)
+            from PyQt6.QtGui import QPixmap
+
+            # El mapa ocupa TODA la pantalla
+            root_layout = QVBoxLayout(self)
             root_layout.setContentsMargins(0, 0, 0, 0)
             root_layout.setSpacing(0)
 
-            left_panel = QWidget()
-            left_panel.setFixedWidth(220)
-            left_panel.setStyleSheet("background: #0d1117; border-right: 1px solid #21262d;")
-            left_layout = QVBoxLayout(left_panel)
-            left_layout.setContentsMargins(10, 14, 10, 10)
-            left_layout.setSpacing(10)
-
-            # --- REEMPLAZO: Título de texto por Imagen ---
-            title = QLabel()
-            
-            # Construye la ruta absoluta hacia la carpeta /icons
-            ruta_imagen = os.path.join(os.path.dirname(__file__), "icons", "tas_cortado.png")
-            pixmap = QPixmap(ruta_imagen)
-            
-            if not pixmap.isNull():
-                # Redimensiona la imagen para que quepa en el panel (220px de ancho menos 20px de márgenes)
-                ancho_maximo = 220 - 20
-                pixmap_escalado = pixmap.scaledToWidth(ancho_maximo, Qt.TransformationMode.SmoothTransformation)
-                title.setPixmap(pixmap_escalado)
-                title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            else:
-                # Fallback por si la imagen no se encuentra en el disco
-                title.setText("[ ERROR: Imagen no encontrada ]")
-                title.setStyleSheet("color: #ff7b72; font-size: 11px; font-weight: bold;")
-            
-            left_layout.addWidget(title)
-            # ---------------------------------------------
-
-            sep = self._make_separator()
-            left_layout.addWidget(sep)
-
-            # Dummy placeholders invisibles para mantener compatibilidad con el resto del código
-            self.btn_connect = QPushButton()
-            self.btn_connect.clicked.connect(self._connect_to_ksp)
-
-            self.btn_disconnect = QPushButton()
-            self.btn_disconnect.clicked.connect(self._disconnect)
-
-            filter_lbl = QLabel("Buscar satélite:")
-            filter_lbl.setStyleSheet("font-size: 10px; color: #6e7681;")
-            left_layout.addWidget(filter_lbl)
-
-            self.txt_filter = QLineEdit()
-            self.txt_filter.setPlaceholderText("Ej. Way-E1")
-            self.txt_filter.setClearButtonEnabled(True)
-            self.txt_filter.textChanged.connect(self._apply_filter)
-            self.txt_filter.setStyleSheet(
-                "QLineEdit { background: #161b22; border: 1px solid #30363d; "
-                "border-radius: 4px; color: #c9d1d9; padding: 4px 6px; font-size: 11px; }"
-                "QLineEdit:focus { border-color: #58a6ff; }"
-            )
-            left_layout.addWidget(self.txt_filter)
-
-            # Botón flotante "← Volver" en la esquina inferior derecha
-            self.btn_back = QPushButton("← Volver", self)
-            self.btn_back.setObjectName("btnBack")
-            self.btn_back.setCursor(Qt.CursorShape.PointingHandCursor)
-            self.btn_back.clicked.connect(self._on_back_clicked)
-            self.btn_back.adjustSize()
-            self.btn_back.show()
-            self.btn_back.raise_()
-
-            self.lbl_status = QLabel("Desconectado")
-            self.lbl_status.setStyleSheet("color: #6e7681; font-size: 11px;")
-            self.lbl_status.setWordWrap(True)
-            left_layout.addWidget(self.lbl_status)
-
-            sep2 = self._make_separator()
-            left_layout.addWidget(sep2)
-
-            naves_hdr = QLabel("NAVES EN ÓRBITA")
-            naves_hdr.setStyleSheet("font-size: 10px; color: #6e7681; letter-spacing: 1px;")
-            left_layout.addWidget(naves_hdr)
-
-            self.scroll = QScrollArea()
-            self.scroll.setWidgetResizable(True)
-            self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-            self.cards_container = QWidget()
-            self.cards_layout = QVBoxLayout(self.cards_container)
-            self.cards_layout.setContentsMargins(0, 0, 0, 0)
-            self.cards_layout.setSpacing(4)
-            self.cards_layout.addStretch()
-            self.scroll.setWidget(self.cards_container)
-            self.scroll.setStyleSheet("background: transparent;")
-            left_layout.addWidget(self.scroll, stretch=1)
-
-
-            root_layout.addWidget(left_panel)
-
-            right_panel = QWidget()
-            right_layout = QVBoxLayout(right_panel)
-            right_layout.setContentsMargins(0, 0, 0, 0)
-            right_layout.setSpacing(0)
-
-            top_bar = QWidget()
-            top_bar_layout = QHBoxLayout(top_bar)
-            top_bar_layout.setContentsMargins(10, 10, 10, 6)
-            top_bar_layout.setSpacing(8)
-            top_bar_layout.addStretch()
-
-            self.btn_reload = QPushButton("↻  Recargar")
-            self.btn_reload.setEnabled(False)
-            self.btn_reload.clicked.connect(self._on_reload_clicked)
-            self.btn_reload.setStyleSheet(
-                "QPushButton { background: #1f6feb33; border-color: #1f6feb; color: #58a6ff; font-weight: bold; }"
-                "QPushButton:hover { background: #1f6feb55; }"
-            )
-            top_bar_layout.addWidget(self.btn_reload)
-            right_layout.addWidget(top_bar)
-
-            self.view = gl.GLViewWidget()
+            # Vista 3D a pantalla completa
+            self.view = gl.GLViewWidget(self)
             self.view.setBackgroundColor('#0d1117')
             self.view.setCameraPosition(distance=5200, elevation=22, azimuth=-45)
             self.view.setMouseTracking(True)
+            root_layout.addWidget(self.view)
 
+            # Info bubble (tooltip flotante sobre el mapa)
             self.info_bubble = QLabel(self.view)
             self.info_bubble.setTextFormat(Qt.TextFormat.RichText)
             self.info_bubble.setStyleSheet("""
@@ -874,19 +776,279 @@ if _KSP_AVAILABLE:
             """)
             self.info_bubble.hide()
 
+            # ── Overlay panel (sobre el mapa, esquina superior-izquierda) ──────
+            self.overlay = QWidget(self)
+            self.overlay.setFixedWidth(260)
+            self.overlay.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+            overlay_layout = QVBoxLayout(self.overlay)
+            overlay_layout.setContentsMargins(12, 14, 12, 14)
+            overlay_layout.setSpacing(8)
+
+            # Logo
+            logo_lbl = QLabel()
+            ruta_imagen = os.path.join(os.path.dirname(__file__), "icons", "tas_cortado.png")
+            px = QPixmap(ruta_imagen)
+            if not px.isNull():
+                px = px.scaledToWidth(236, Qt.TransformationMode.SmoothTransformation)
+                logo_lbl.setPixmap(px)
+                logo_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+            else:
+                logo_lbl.setText("Terranova Aerospace")
+                logo_lbl.setStyleSheet("color:#dce9f6; font-size:14px; font-weight:700;")
+            overlay_layout.addWidget(logo_lbl)
+
+            # Buscador
+            self.txt_filter = QLineEdit()
+            self.txt_filter.setPlaceholderText("🔍  Buscar satélite…")
+            self.txt_filter.setClearButtonEnabled(True)
+            self.txt_filter.textChanged.connect(self._apply_filter)
+            self.txt_filter.setStyleSheet("""
+                QLineEdit {
+                    background: rgba(13,17,23,210);
+                    border: 1px solid #30363d;
+                    border-radius: 6px;
+                    color: #c9d1d9;
+                    padding: 7px 10px;
+                    font-size: 12px;
+                }
+                QLineEdit:focus { border-color: #58a6ff; }
+            """)
+            overlay_layout.addWidget(self.txt_filter)
+
+            # Contenedor animado de resultados
+            self.results_widget = QWidget()
+            self.results_widget.setStyleSheet("background: transparent;")
+            self.results_layout = QVBoxLayout(self.results_widget)
+            self.results_layout.setContentsMargins(0, 2, 0, 2)
+            self.results_layout.setSpacing(2)
+            self.results_widget.setMaximumHeight(0)   # Oculto inicialmente
+            overlay_layout.addWidget(self.results_widget)
+
+            # Panel de información del satélite seleccionado
+            self.info_panel = QFrame()
+            self.info_panel.setStyleSheet("""
+                QFrame {
+                    background: rgba(13,17,23,210);
+                    border: 1px solid #30363d;
+                    border-radius: 8px;
+                }
+            """)
+            info_layout = QVBoxLayout(self.info_panel)
+            info_layout.setContentsMargins(10, 10, 10, 10)
+            info_layout.setSpacing(5)
+
+            self.info_title = QLabel("")
+            self.info_title.setStyleSheet("color:#e6edf3; font-weight:bold; font-size:12px; background:transparent;")
+            self.info_title.setTextFormat(Qt.TextFormat.RichText)
+            info_layout.addWidget(self.info_title)
+
+            self.info_body = QLabel("")
+            self.info_body.setStyleSheet("color:#c9d1d9; font-size:11px; background:transparent; line-height:160%;")
+            self.info_body.setTextFormat(Qt.TextFormat.RichText)
+            self.info_body.setWordWrap(True)
+            info_layout.addWidget(self.info_body)
+
+            self.btn_close_result = QPushButton("Cerrar resultado")
+            self.btn_close_result.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.btn_close_result.setStyleSheet("""
+                QPushButton {
+                    background: transparent;
+                    color: #6e7681;
+                    border: 1px solid #30363d;
+                    border-radius: 5px;
+                    padding: 4px 10px;
+                    font-size: 11px;
+                    margin-top: 4px;
+                }
+                QPushButton:hover {
+                    color: #c9d1d9;
+                    border-color: #58a6ff;
+                }
+                QPushButton:pressed {
+                    color: #8b949e;
+                }
+            """)
+            self.btn_close_result.clicked.connect(self._deselect_vessel)
+            info_layout.addWidget(self.btn_close_result)
+
+            self.info_panel.hide()
+            overlay_layout.addWidget(self.info_panel)
+
+            overlay_layout.addStretch()
+
+            # Dummy widgets para compatibilidad interna (no visibles)
+            self.btn_connect    = QPushButton()
+            self.btn_connect.clicked.connect(self._connect_to_ksp)
+            self.btn_disconnect = QPushButton()
+            self.btn_disconnect.clicked.connect(self._disconnect)
+            self.btn_reload     = QPushButton()
+            self.btn_reload.clicked.connect(self._on_reload_clicked)
+            self.lbl_status     = QLabel()
+
+            # Botón "← Volver" flotante en esquina inferior-izquierda
+            self.btn_back = QPushButton("← Volver", self)
+            self.btn_back.setObjectName("btnBack")
+            self.btn_back.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.btn_back.clicked.connect(self._on_back_clicked)
+            self.btn_back.adjustSize()
+            self.btn_back.show()
+            self.btn_back.raise_()
+
+            # Animación de altura para el contenedor de resultados
+            self._results_anim = QPropertyAnimation(self.results_widget, b"maximumHeight")
+            self._results_anim.setDuration(220)
+            self._results_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+            # Conectar eventos del mapa
             self.view.mouseMoveEvent    = self._mouse_move
             self.view.mousePressEvent   = self._mouse_press
             self.view.mouseReleaseEvent = self._mouse_release
             self.view.wheelEvent        = self._wheel_event
-
-            right_layout.addWidget(self.view, stretch=1)
-            root_layout.addWidget(right_panel, stretch=1)
 
         def _make_separator(self) -> QFrame:
             sep = QFrame()
             sep.setFrameShape(QFrame.Shape.HLine)
             sep.setStyleSheet("color: #21262d; margin: 2px 0;")
             return sep
+
+        # ── Resultados de búsqueda animados ───────────────────────────────────
+
+        def _rebuild_results(self):
+            """Reconstruye la lista de resultados según el filtro activo."""
+            # Limpiar resultados anteriores
+            while self.results_layout.count():
+                item = self.results_layout.takeAt(0)
+                w = item.widget()
+                if w:
+                    w.deleteLater()
+
+            text = self.active_filter_text
+            if not text:
+                self._animate_results(0)
+                return
+
+            matches = [
+                vid for vid in self.render_objects
+                if text in vid.lower()
+            ]
+
+            if not matches:
+                no_res = QLabel("Sin resultados")
+                no_res.setStyleSheet("color:#6e7681; font-size:11px; padding:4px 6px; background:transparent;")
+                self.results_layout.addWidget(no_res)
+                self._animate_results(32)
+                return
+
+            for vid in matches:
+                btn = QPushButton(f"🛰  {vid}")
+                btn.setStyleSheet("""
+                    QPushButton {
+                        background: rgba(13,17,23,210);
+                        color: #c9d1d9;
+                        border: 1px solid #30363d;
+                        border-left: 3px solid #58a6ff;
+                        border-radius: 5px;
+                        padding: 6px 10px;
+                        text-align: left;
+                        font-size: 11px;
+                    }
+                    QPushButton:hover {
+                        background: rgba(30,40,60,240);
+                        border-color: #58a6ff;
+                        color: #e6edf3;
+                    }
+                    QPushButton:pressed {
+                        background: rgba(10,15,25,240);
+                    }
+                """)
+                btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                btn.clicked.connect(lambda checked=False, v=vid: self._select_vessel(v))
+                self.results_layout.addWidget(btn)
+
+            target_h = min(len(matches) * 38, 240)
+            self._animate_results(target_h)
+
+        def _animate_results(self, target_h: int):
+            self._results_anim.stop()
+            self._results_anim.setStartValue(self.results_widget.maximumHeight())
+            self._results_anim.setEndValue(target_h)
+            self._results_anim.start()
+
+        def _select_vessel(self, vessel_name: str):
+            """Selecciona un satélite: muestra info, oculta resultados, hace zoom."""
+            if vessel_name not in self.render_objects:
+                return
+            self.selected_vessel = vessel_name
+            # Limpiar búsqueda y cerrar resultados
+            self.txt_filter.blockSignals(True)
+            self.txt_filter.clear()
+            self.txt_filter.blockSignals(False)
+            self.active_filter_text = ""
+            self._animate_results(0)
+
+            self._update_selection_visuals()
+            self._update_info_panel(vessel_name)
+            self.info_panel.show()
+
+            # Zoom y seguimiento de cámara
+            self._focus_camera_on(vessel_name)
+
+        def _focus_camera_on(self, vessel_name: str):
+            """Centra la cámara en el satélite seleccionado."""
+            obj = self.render_objects.get(vessel_name)
+            if obj is None or 'pos_3d' not in obj:
+                return
+            sx, sy, sz = obj['pos_3d']
+            dist = max(800.0, math.hypot(math.hypot(sx, sy), sz) * 1.8)
+            dist = min(dist, 4000.0)
+            # Calcular azimut y elevación para apuntar a la posición
+            azim = math.degrees(math.atan2(sy, sx))
+            elev = math.degrees(math.atan2(sz, math.hypot(sx, sy)))
+            self.view.setCameraPosition(distance=dist, azimuth=azim, elevation=elev)
+            self.view.update()
+
+        def _update_info_panel(self, vessel_name: str):
+            """Rellena el panel con los datos del satélite en texto limpio."""
+            obj = self.render_objects.get(vessel_name, {})
+            info = obj.get('info_data', {})
+            cidx = obj.get('color_idx', 0)
+            color = DOT_COLORS[cidx % len(DOT_COLORS)]
+            color_hex = "#{:02X}{:02X}{:02X}".format(
+                int(color[0]*255), int(color[1]*255), int(color[2]*255)
+            )
+            self.info_title.setText(
+                f"<span style='color:{color_hex}'>🛰 {vessel_name}</span>"
+            )
+
+            alt_km  = info.get('alt_km', 0)
+            period  = info.get('period', 0)
+            inc_rad = info.get('inc', 0)
+            ecc     = info.get('ecc', 0)
+            vel_ms  = info.get('vel_ms', 0)
+
+            c_key = "#6e7681"   # color etiqueta
+            c_val = "#e6edf3"   # color valor
+            self.info_body.setText(
+                f"<span style='color:{c_key}'>Altitud</span>  "
+                f"<span style='color:{c_val}'>{alt_km:,.0f} km</span><br>"
+                f"<span style='color:{c_key}'>Período</span>  "
+                f"<span style='color:{c_val}'>{VesselInfoCard._fmt_time(period)}</span><br>"
+                f"<span style='color:{c_key}'>Inclinación</span>  "
+                f"<span style='color:{c_val}'>{math.degrees(inc_rad):.2f}°</span><br>"
+                f"<span style='color:{c_key}'>Excentricidad</span>  "
+                f"<span style='color:{c_val}'>{ecc:.4f}</span><br>"
+                f"<span style='color:{c_key}'>Velocidad</span>  "
+                f"<span style='color:{c_val}'>{vel_ms:,.0f} m/s</span>"
+            )
+
+        def _deselect_vessel(self):
+            """Cierra el panel de info y restaura la vista general."""
+            self.selected_vessel = None
+            self.info_panel.hide()
+            self._hide_info_bubble()
+            self._update_selection_visuals()
+            self.view.setCameraPosition(distance=5200, elevation=22, azimuth=-45)
+            self.view.update()
 
         def _init_static_scene(self):
             md = gl.MeshData.sphere(rows=30, cols=48, radius=PLANET_DRAW_RADIUS)
@@ -921,10 +1083,6 @@ if _KSP_AVAILABLE:
             self.stars.setDepthValue(-100)
 
         def _connect_to_ksp(self):
-            self.btn_connect.setEnabled(False)
-            self.lbl_status.setText("Conectando…")
-            self.lbl_status.setStyleSheet("color: #d29922; font-size: 11px;")
-
             self.connect_thread = ConnectThread()
             self.connect_thread.success.connect(self._on_connected)
             self.connect_thread.failure.connect(self._on_connect_failed)
@@ -932,18 +1090,12 @@ if _KSP_AVAILABLE:
 
         def _on_connected(self, conn):
             self.conn = conn
-            self.lbl_status.setText("Conectado  ●")
-            self.lbl_status.setStyleSheet("color: #3fb950; font-size: 11px;")
-            self.btn_disconnect.setEnabled(True)
-            self.btn_reload.setEnabled(True)
             self._camera_fitted = False
             self._reload_data()
             self.timer.start(1000)
 
         def _on_connect_failed(self, err: str):
-            self.lbl_status.setText(f"Error: {err}")
-            self.lbl_status.setStyleSheet("color: #f85149; font-size: 11px;")
-            self.btn_connect.setEnabled(True)
+            pass  # Sin UI de estado visible
 
         def _disconnect(self):
             self.timer.stop()
@@ -956,11 +1108,6 @@ if _KSP_AVAILABLE:
                     pass
                 self.conn = None
 
-            self.lbl_status.setText("Desconectado")
-            self.lbl_status.setStyleSheet("color: #6e7681; font-size: 11px;")
-            self.btn_connect.setEnabled(True)
-            self.btn_disconnect.setEnabled(False)
-            self.btn_reload.setEnabled(False)
             self._camera_fitted = False
 
         def _clear_all_vessels(self):
@@ -971,15 +1118,14 @@ if _KSP_AVAILABLE:
                             self.view.removeItem(obj[key])
                         except Exception:
                             pass
-                if 'info_card' in obj and obj['info_card'] is not None:
-                    obj['info_card'].deleteLater()
 
             self.render_objects.clear()
 
             for vid, streams in self.vessel_streams.items():
                 for s in streams.values():
                     try:
-                        s.remove()
+                        if s is not None:
+                            s.remove()
                     except Exception:
                         pass
             self.vessel_streams.clear()
@@ -987,6 +1133,8 @@ if _KSP_AVAILABLE:
             self._camera_fitted = False
             self.active_filter_text = ""
             self.selected_vessel = None
+            if hasattr(self, 'info_panel'):
+                self.info_panel.hide()
             self._hide_info_bubble()
 
         def _on_back_clicked(self):
@@ -994,14 +1142,8 @@ if _KSP_AVAILABLE:
             self.back_clicked.emit()
 
         def _set_selected_vessel(self, vessel_name: str):
-            if vessel_name not in self.render_objects:
-                return
-            self.selected_vessel = vessel_name
-            projected = self._project_vessel(vessel_name)
-            if projected is not None:
-                self.info_bubble_locked = True
-                self._show_info_bubble(vessel_name, projected[0], projected[1])
-            self._update_selection_visuals()
+            """Redirige a _select_vessel para compatibilidad."""
+            self._select_vessel(vessel_name)
 
         def _project_point(self, point_3d):
             vw = self.view.width()
@@ -1082,7 +1224,7 @@ if _KSP_AVAILABLE:
                 f"<span style='color:#8b949e'>Periodo:</span> {VesselInfoCard._fmt_time(info.get('period', 0))}<br>"
                 f"<span style='color:#8b949e'>Inclinación:</span> {math.degrees(info.get('inc', 0)):.2f}°<br>"
                 f"<span style='color:#8b949e'>Excentricidad:</span> {info.get('ecc', 0):.4f}<br>"
-                f"<span style='color:#8b949e'>Velocidad:</span> {info.get('vel_ms', 0):,.0f} m/s"
+                f"<span style='color:#8b949e'>Velocidad:</span> {info.get('vel_ms', 0):.0f} m/s"
             )
 
         def _show_info_bubble(self, vessel_name: str, px: float, py: float):
@@ -1104,14 +1246,7 @@ if _KSP_AVAILABLE:
         def _on_reload_clicked(self):
             if not self.conn:
                 return
-            self.btn_reload.setEnabled(False)
-            for frame in ("↻  Recargando", "⟳  Recargando", "↺  Recargando"):
-                self.btn_reload.setText(frame)
-                QApplication.processEvents()
-                time.sleep(0.04)
             self._reload_data()
-            self.btn_reload.setEnabled(True)
-            self.btn_reload.setText("↻  Recargar")
 
         def _update_selection_visuals(self):
             if self.selected_vessel is not None and self.selected_vessel not in self.render_objects:
@@ -1119,16 +1254,11 @@ if _KSP_AVAILABLE:
 
             for vid, obj in self.render_objects.items():
                 is_selected = self.selected_vessel == vid
-                is_match = (
-                    not self.active_filter_text or
-                    self.active_filter_text in vid.lower()
-                )
                 show_in_map = self.selected_vessel is None or is_selected
 
                 line = obj.get('line')
                 dot = obj.get('dot')
                 trail = obj.get('trail_line')
-                card = obj.get('info_card')
 
                 if line is not None:
                     line.setVisible(show_in_map)
@@ -1149,27 +1279,26 @@ if _KSP_AVAILABLE:
                     trail_colors = obj.get('trail_colors')
                     if show_in_map and trail_colors is not None:
                         colors = trail_colors.copy()
-                        colors[:, 3] = colors[:, 3]
                         trail.setData(pos=obj['trail_buf'], color=colors)
-
-                if card is not None:
-                    card.setVisible(is_match)
-                    card.set_selected(is_selected)
 
         def _apply_filter(self, text: str):
             self.active_filter_text = (text or "").strip().lower()
-            if self.selected_vessel is not None and self.active_filter_text and self.active_filter_text not in self.selected_vessel.lower():
-                self.selected_vessel = None
-                self._hide_info_bubble()
-            self._update_selection_visuals()
+            # Si hay texto activo, deseleccionar y ocultar info panel
+            if self.active_filter_text:
+                if self.selected_vessel is not None:
+                    self.selected_vessel = None
+                    self.info_panel.hide()
+                    self._hide_info_bubble()
+                    self._update_selection_visuals()
+            else:
+                # Campo vacío: colapsar resultados sin deselectar
+                self._animate_results(0)
+                return
+            self._rebuild_results()
 
         def _reload_data(self):
             if not self.conn:
                 return
-
-            self.lbl_status.setText("Recargando…")
-            self.lbl_status.setStyleSheet("color: #d29922; font-size: 11px;")
-            QApplication.processEvents()
 
             for obj in self.render_objects.values():
                 if 'trail_buf' in obj and obj['trail_buf'] is not None:
@@ -1185,14 +1314,10 @@ if _KSP_AVAILABLE:
                         )
 
             self._update_orbits()
-            self._apply_filter(self.txt_filter.text())
-            if self.info_bubble_locked and self.selected_vessel is not None:
-                projected = self._project_vessel(self.selected_vessel)
-                if projected is not None:
-                    self._show_info_bubble(self.selected_vessel, projected[0], projected[1])
-            if self.conn:
-                self.lbl_status.setText("Conectado  ●")
-                self.lbl_status.setStyleSheet("color: #3fb950; font-size: 11px;")
+            # Refrescar panel de info si hay selección activa
+            if self.selected_vessel is not None and self.selected_vessel in self.render_objects:
+                self._update_info_panel(self.selected_vessel)
+                self._focus_camera_on(self.selected_vessel)
 
         def _update_orbits(self):
             if not self.conn:
@@ -1223,11 +1348,16 @@ if _KSP_AVAILABLE:
                                 'period':         self.conn.add_stream(getattr, orb, 'period'),
                                 'true_anomaly':   self.conn.add_stream(getattr, orb, 'true_anomaly'),
                             }
+                            # Velocidad orbital directa desde el objeto orbit (evita el bug de 0 m/s)
                             try:
                                 self.vessel_streams[vid]['orbital_speed'] = \
-                                    self.conn.add_stream(getattr, vessel.flight(vessel.orbit.body.reference_frame), 'speed')
+                                    self.conn.add_stream(getattr, vessel.orbit, 'speed')
                             except Exception:
-                                self.vessel_streams[vid]['orbital_speed'] = None
+                                try:
+                                    self.vessel_streams[vid]['orbital_speed'] = \
+                                        self.conn.add_stream(getattr, vessel.flight(vessel.orbit.body.non_rotating_reference_frame), 'speed')
+                                except Exception:
+                                    self.vessel_streams[vid]['orbital_speed'] = None
 
                         streams = self.vessel_streams[vid]
                         situation = streams['situation']()
@@ -1330,12 +1460,6 @@ if _KSP_AVAILABLE:
                             self.view.addItem(dot)
                             self.view.addItem(trail_line)
 
-                            card = VesselInfoCard(vid, lc)
-                            card.clicked.connect(self._set_selected_vessel)
-                            self.cards_layout.insertWidget(
-                                self.cards_layout.count() - 1, card
-                            )
-
                             self.render_objects[vid] = {
                                 'line': line,
                                 'orbit_pts': rotated,
@@ -1350,9 +1474,7 @@ if _KSP_AVAILABLE:
                                 'pos_3d': (sx, sy, sz),
                                 'info_data': info_data,
                                 'color_idx': cidx,
-                                'info_card': card,
                             }
-                            card.update_data(alt_km, period, inc, ecc, vel_ms)
                         else:
                             obj = self.render_objects[vid]
                             obj['orbit_pts'] = rotated
@@ -1378,7 +1500,10 @@ if _KSP_AVAILABLE:
                                 tc = obj['trail_colors'][:len(ordered)]
                                 obj['trail_line'].setData(pos=ordered, color=tc)
 
-                            obj['info_card'].update_data(alt_km, period, inc, ecc, vel_ms)
+                            # Actualizar panel de info si este satélite está seleccionado
+                            if self.selected_vessel == vid:
+                                self._update_info_panel(vid)
+                                self._focus_camera_on(vid)
 
                     except Exception:
                         continue
@@ -1397,11 +1522,10 @@ if _KSP_AVAILABLE:
                                     self.view.removeItem(obj[key])
                                 except Exception:
                                     pass
-                        if obj.get('info_card') is not None:
-                            obj['info_card'].deleteLater()
                         del self.render_objects[vid]
                         if self.selected_vessel == vid:
                             self.selected_vessel = None
+                            self.info_panel.hide()
                             self._hide_info_bubble()
 
                         if vid in self.vessel_streams:
@@ -1428,18 +1552,24 @@ if _KSP_AVAILABLE:
                 hit = self._vessel_at_cursor(event)
                 if hit is not None:
                     vid, px, py = hit
-                    self.selected_vessel = vid
-                    self.info_bubble_locked = True
-                    self._show_info_bubble(vid, px, py)
-                    self._update_selection_visuals()
+                    self._select_vessel(vid)
                     self.is_rotating = False
+                    self._press_pos = None   # no deseleccionar en release
                     return
+                # Guardar posición del press para distinguir click de drag
+                self._press_pos = event.position()
                 self.is_rotating = True
                 self.last_mouse_pos = event.position()
 
         def _mouse_release(self, event):
             if event.button() == Qt.MouseButton.LeftButton:
                 self.is_rotating = False
+                # Solo deseleccionar si fue un click puro (sin arrastre)
+                if self._press_pos is not None and self.selected_vessel is not None:
+                    delta = event.position() - self._press_pos
+                    if (delta.x() ** 2 + delta.y() ** 2) < 16:  # < 4px de movimiento
+                        self._deselect_vessel()
+                self._press_pos = None
 
         def _wheel_event(self, event):
             delta = event.angleDelta().y()
@@ -1480,21 +1610,30 @@ if _KSP_AVAILABLE:
 
         def resizeEvent(self, event):
             super().resizeEvent(event)
+            self._reposition_overlay()
             self._reposition_back_button()
 
         def showEvent(self, event):
             super().showEvent(event)
+            self._reposition_overlay()
             self._reposition_back_button()
             if hasattr(self, 'btn_back'):
                 self.btn_back.raise_()
 
+        def _reposition_overlay(self):
+            if hasattr(self, 'overlay') and self.overlay is not None:
+                h = self.height() if self.height() > 0 else 800
+                self.overlay.setGeometry(0, 0, 260, h)
+                self.overlay.raise_()
+
         def _reposition_back_button(self):
             if hasattr(self, 'btn_back') and self.btn_back is not None:
                 self.btn_back.adjustSize()
-                w = max(self.btn_back.width(), 90)
+                w = max(self.btn_back.width(), 100)
                 h = self.btn_back.height()
                 self.btn_back.setFixedSize(w, h)
-                self.btn_back.move(self.width() - w - 24, self.height() - h - 20)
+                # Posición: esquina inferior-izquierda
+                self.btn_back.move(16, self.height() - h - 16)
                 self.btn_back.raise_()
 
 else:
