@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, QRect, QSize, Qt, QTimer, QThread, pyqtSignal
-from PyQt6.QtGui import QColor, QPainter, QPen, QPixmap, QPalette, QFont, QCursor
+from PyQt6.QtGui import QColor, QPainter, QPen, QPixmap, QPalette, QFont, QCursor, QVector3D
 from PyQt6.QtWidgets import (
     QApplication,
     QFrame,
@@ -799,7 +799,7 @@ if _KSP_AVAILABLE:
 
             # Buscador
             self.txt_filter = QLineEdit()
-            self.txt_filter.setPlaceholderText("🔍  Buscar satélite…")
+            self.txt_filter.setPlaceholderText("Buscar objeto…")
             self.txt_filter.setClearButtonEnabled(True)
             self.txt_filter.textChanged.connect(self._apply_filter)
             self.txt_filter.setStyleSheet("""
@@ -905,6 +905,8 @@ if _KSP_AVAILABLE:
             self.view.mouseReleaseEvent = self._mouse_release
             self.view.wheelEvent        = self._wheel_event
 
+            
+
         def _make_separator(self) -> QFrame:
             sep = QFrame()
             sep.setFrameShape(QFrame.Shape.HLine)
@@ -990,21 +992,25 @@ if _KSP_AVAILABLE:
             self._update_info_panel(vessel_name)
             self.info_panel.show()
 
-            # Zoom y seguimiento de cámara
-            self._focus_camera_on(vessel_name)
+            # Zoom y seguimiento de cámara inicial (reinicia ángulos y zoom)
+            self._focus_camera_on(vessel_name, initial=True)
 
-        def _focus_camera_on(self, vessel_name: str):
-            """Centra la cámara en el satélite seleccionado."""
+        def _focus_camera_on(self, vessel_name: str, initial: bool = False):
+            """Centra la cámara en el satélite seleccionado. Preserva zoom y rotación a menos que initial=True."""
             obj = self.render_objects.get(vessel_name)
             if obj is None or 'pos_3d' not in obj:
                 return
             sx, sy, sz = obj['pos_3d']
-            dist = max(800.0, math.hypot(math.hypot(sx, sy), sz) * 1.8)
-            dist = min(dist, 4000.0)
-            # Calcular azimut y elevación para apuntar a la posición
-            azim = math.degrees(math.atan2(sy, sx))
-            elev = math.degrees(math.atan2(sz, math.hypot(sx, sy)))
-            self.view.setCameraPosition(distance=dist, azimuth=azim, elevation=elev)
+            pos = QVector3D(sx, sy, sz)
+            if initial:
+                dist = max(800.0, math.hypot(math.hypot(sx, sy), sz) * 1.8)
+                dist = min(dist, 4000.0)
+                # Calcular azimut y elevación para apuntar a la posición
+                azim = math.degrees(math.atan2(sy, sx))
+                elev = math.degrees(math.atan2(sz, math.hypot(sx, sy)))
+                self.view.setCameraPosition(pos=pos, distance=dist, azimuth=azim, elevation=elev)
+            else:
+                self.view.setCameraPosition(pos=pos)
             self.view.update()
 
         def _update_info_panel(self, vessel_name: str):
@@ -1047,7 +1053,7 @@ if _KSP_AVAILABLE:
             self.info_panel.hide()
             self._hide_info_bubble()
             self._update_selection_visuals()
-            self.view.setCameraPosition(distance=5200, elevation=22, azimuth=-45)
+            self.view.setCameraPosition(pos=QVector3D(0, 0, 0), distance=5200, elevation=22, azimuth=-45)
             self.view.update()
 
         def _init_static_scene(self):
@@ -1314,10 +1320,10 @@ if _KSP_AVAILABLE:
                         )
 
             self._update_orbits()
-            # Refrescar panel de info si hay selección activa
+            # Refrescar panel de info si hay selección activa (no reinicia la orientación)
             if self.selected_vessel is not None and self.selected_vessel in self.render_objects:
                 self._update_info_panel(self.selected_vessel)
-                self._focus_camera_on(self.selected_vessel)
+                self._focus_camera_on(self.selected_vessel, initial=False)
 
         def _update_orbits(self):
             if not self.conn:
@@ -1503,7 +1509,7 @@ if _KSP_AVAILABLE:
                             # Actualizar panel de info si este satélite está seleccionado
                             if self.selected_vessel == vid:
                                 self._update_info_panel(vid)
-                                self._focus_camera_on(vid)
+                                self._focus_camera_on(vid, initial=False)
 
                     except Exception:
                         continue
@@ -1629,9 +1635,24 @@ if _KSP_AVAILABLE:
         def _reposition_back_button(self):
             if hasattr(self, 'btn_back') and self.btn_back is not None:
                 self.btn_back.adjustSize()
-                w = max(self.btn_back.width(), 100)
+                w = max(self.btn_back.width(), 1)
                 h = self.btn_back.height()
                 self.btn_back.setFixedSize(w, h)
+                
+                # --- NUEVO: Estilo transparente con subrayado al pasar el cursor ---
+                self.btn_back.setStyleSheet("""
+                    QPushButton {
+                        background: transparent;
+                        border: none;
+                        color: #FFFFFF; /* Cambia el color del texto si lo necesitas */
+                        text-decoration: none;
+                    }
+                    QPushButton:hover {
+                        text-decoration: underline;
+                    }
+                """)
+                # -----------------------------------------------------------------
+
                 # Posición: esquina inferior-izquierda
                 self.btn_back.move(16, self.height() - h - 16)
                 self.btn_back.raise_()
