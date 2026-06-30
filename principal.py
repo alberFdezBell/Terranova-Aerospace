@@ -798,6 +798,9 @@ if _KSP_AVAILABLE:
             self.timer = QTimer(self)
             self.timer.timeout.connect(self._update_orbits)
 
+            self.vessels_to_update = []
+            self.current_vessel_index = 0
+
             if conn is not None:
                 self._on_connected(conn)
 
@@ -1250,7 +1253,7 @@ if _KSP_AVAILABLE:
             self.conn = conn
             self._camera_fitted = False
             self._reload_data()
-            self.timer.start(3000)
+            self.timer.start(300)
 
         def _on_connect_failed(self, err: str):
             pass  # Sin UI de estado visible
@@ -1509,13 +1512,13 @@ if _KSP_AVAILABLE:
                             color=trail_colors[:1]
                         )
 
-            self._update_orbits()
+            self._load_all_vessels_initially()
             # Refrescar panel de info si hay selección activa (no reinicia la orientación)
             if self.selected_vessel is not None and self.selected_vessel in self.render_objects:
                 self._update_info_panel(self.selected_vessel)
                 self._focus_camera_on(self.selected_vessel, initial=False)
 
-        def _update_orbits(self):
+        def _load_all_vessels_initially(self):
             if not self.conn:
                 return
 
@@ -1526,7 +1529,7 @@ if _KSP_AVAILABLE:
                 sin_t = np.sin(theta)
                 max_orbit_radius = KERBIN_RADIUS_KM
 
-                vessels = self.conn.space_center.vessels
+                vessels = list(self.conn.space_center.vessels)
 
                 for vessel in vessels:
                     try:
@@ -1544,7 +1547,6 @@ if _KSP_AVAILABLE:
                                 'period':         self.conn.add_stream(getattr, orb, 'period'),
                                 'true_anomaly':   self.conn.add_stream(getattr, orb, 'true_anomaly'),
                             }
-                            # Velocidad orbital directa desde el objeto orbit (evita el bug de 0 m/s)
                             try:
                                 self.vessel_streams[vid]['orbital_speed'] = \
                                     self.conn.add_stream(getattr, vessel.orbit, 'speed')
@@ -1639,7 +1641,6 @@ if _KSP_AVAILABLE:
                                 color=dc, size=8, pxMode=True, glOptions='opaque'
                             )
 
-                            # Inicializar el buffer de rastro con la posición inicial del satélite (evita líneas al origen)
                             trail_buf = np.empty((TRAIL_LEN, 3), dtype=np.float32)
                             trail_buf[:, 0] = sx
                             trail_buf[:, 1] = sy
@@ -1694,23 +1695,12 @@ if _KSP_AVAILABLE:
                                 idx = obj['trail_head']
                                 ordered = np.roll(buf, -idx, axis=0)
                             else:
-                                # Solo usar los slots que han sido escritos, el resto queda en la posición inicial del satélite (sin línea al origen)
                                 ordered = buf[:head + 1] if head > 0 else buf[:1]
 
                             obj['ordered_trail'] = ordered
 
-                            # Actualizar panel de info si este satélite está seleccionado
-                            if self.selected_vessel == vid:
-                                self._update_info_panel(vid)
-                                self._focus_camera_on(vid, initial=False)
-
                     except Exception:
                         continue
-
-                if not self._camera_fitted and active_vids:
-                    target_distance = max(5200.0, max_orbit_radius * 1.5)
-                    self.view.setCameraPosition(distance=target_distance)
-                    self._camera_fitted = True
 
                 for vid in list(self.render_objects.keys()):
                     if vid not in active_vids:
@@ -1736,18 +1726,207 @@ if _KSP_AVAILABLE:
                                     pass
                             del self.vessel_streams[vid]
 
-                # Aplicar colores y visibilidad correctos (respeta hover y selección)
+                if not self._camera_fitted and active_vids:
+                    target_distance = max(5200.0, max_orbit_radius * 1.5)
+                    self.view.setCameraPosition(distance=target_distance)
+                    self._camera_fitted = True
+
+                self._update_selection_visuals()
+
+                # Guardar naves activas para actualizar secuencialmente
+                self.vessels_to_update = [v for v in vessels if v.name in active_vids]
+                self.current_vessel_index = 0
+
+            except Exception as e:
+                self._handle_update_error(e)
+
+        def _update_orbits(self):
+            if not self.conn:
+                return
+
+            try:
+                # Si hemos recorrido todas las naves, solicitamos los datos globales (número de satélites / cambios)
+                if not hasattr(self, 'vessels_to_update') or not self.vessels_to_update or self.current_vessel_index >= len(self.vessels_to_update):
+                    vessels = list(self.conn.space_center.vessels)
+                    active_vids = set()
+
+                    for vessel in vessels:
+                        try:
+                            vid = vessel.name
+                            if vid not in self.vessel_streams:
+                                orb = vessel.orbit
+                                self.vessel_streams[vid] = {
+                                    'situation':      self.conn.add_stream(getattr, vessel, 'situation'),
+                                    'sma':            self.conn.add_stream(getattr, orb, 'semi_major_axis'),
+                                    'inc':            self.conn.add_stream(getattr, orb, 'inclination'),
+                                    'lan':            self.conn.add_stream(getattr, orb, 'longitude_of_ascending_node'),
+                                    'argp':           self.conn.add_stream(getattr, orb, 'argument_of_periapsis'),
+                                    'ecc':            self.conn.add_stream(getattr, orb, 'eccentricity'),
+                                    'period':         self.conn.add_stream(getattr, orb, 'period'),
+                                    'true_anomaly':   self.conn.add_stream(getattr, orb, 'true_anomaly'),
+                                }
+                                try:
+                                    self.vessel_streams[vid]['orbital_speed'] = \
+                                        self.conn.add_stream(getattr, vessel.orbit, 'speed')
+                                except Exception:
+                                    try:
+                                        self.vessel_streams[vid]['orbital_speed'] = \
+                                            self.conn.add_stream(getattr, vessel.flight(vessel.orbit.body.non_rotating_reference_frame), 'speed')
+                                    except Exception:
+                                        self.vessel_streams[vid]['orbital_speed'] = None
+
+                            streams = self.vessel_streams[vid]
+                            situation = streams['situation']()
+                            sma = streams['sma']()
+
+                            if situation.name not in ('orbiting', 'escaping') or sma <= 0:
+                                continue
+
+                            try:
+                                if vessel.orbit.periapsis_altitude < 0:
+                                    continue
+                            except Exception:
+                                pass
+
+                            active_vids.add(vid)
+                        except Exception:
+                            continue
+
+                    for vid in list(self.render_objects.keys()):
+                        if vid not in active_vids:
+                            obj = self.render_objects[vid]
+                            for key in ('line', 'dot', 'trail_line'):
+                                if obj.get(key) is not None:
+                                    try:
+                                        self.view.removeItem(obj[key])
+                                    except Exception:
+                                        pass
+                            del self.render_objects[vid]
+                            if self.selected_vessel == vid:
+                                self.selected_vessel = None
+                                self.info_panel.hide()
+                                self._hide_info_bubble()
+
+                            if vid in self.vessel_streams:
+                                for s in self.vessel_streams[vid].values():
+                                    try:
+                                        if s is not None:
+                                            s.remove()
+                                    except Exception:
+                                        pass
+                                del self.vessel_streams[vid]
+
+                    self.vessels_to_update = [v for v in vessels if v.name in active_vids]
+                    self.current_vessel_index = 0
+                    self._update_selection_visuals()
+
+                if not self.vessels_to_update:
+                    return
+
+                # Actualizar el siguiente satélite
+                vessel = self.vessels_to_update[self.current_vessel_index]
+                self.current_vessel_index += 1
+
+                vid = vessel.name
+                if vid not in self.vessel_streams or vid not in self.render_objects:
+                    return
+
+                streams = self.vessel_streams[vid]
+                sma = streams['sma']()
+                inc = streams['inc']()
+                lan = streams['lan']()
+                argp = streams['argp']()
+                ecc = streams['ecc']()
+                period = streams['period']()
+                r_orbit = sma / 1000.0
+
+                theta = np.linspace(0, 2 * np.pi, ORBIT_POINTS)
+                cos_t = np.cos(theta)
+                sin_t = np.sin(theta)
+
+                if ecc < 0.999:
+                    r_theta = r_orbit * (1 - ecc**2) / (1 + ecc * cos_t)
+                else:
+                    r_theta = np.full_like(theta, r_orbit)
+
+                x_orb = r_theta * cos_t
+                y_orb = r_theta * sin_t
+                z_orb = np.zeros(ORBIT_POINTS)
+
+                ci, si_ = np.cos(inc), np.sin(inc)
+                cl, sl  = np.cos(lan), np.sin(lan)
+                ca, sa  = np.cos(argp), np.sin(argp)
+
+                R_inc = np.array([[1, 0, 0], [0, ci, -si_], [0, si_, ci]])
+                R_argp = np.array([[ca, -sa, 0], [sa, ca, 0], [0, 0, 1]])
+                R_lan = np.array([[cl, -sl, 0], [sl, cl, 0], [0, 0, 1]])
+                R = R_lan @ R_inc @ R_argp
+
+                orbital_coords = np.vstack((x_orb, y_orb, z_orb))
+                rotated = (R @ orbital_coords).T.astype(np.float32)
+
+                true_anom = streams['true_anomaly']()
+                r_now = r_orbit * (1 - ecc**2) / (1 + ecc * np.cos(true_anom))
+                x_now = r_now * np.cos(true_anom)
+                y_now = r_now * np.sin(true_anom)
+                pos_now = (R @ np.array([x_now, y_now, 0.0]))
+                sx, sy, sz = float(pos_now[0]), float(pos_now[1]), float(pos_now[2])
+
+                alt_km = r_now - KERBIN_RADIUS_KM
+
+                vel_ms = 0.0
+                try:
+                    if streams['orbital_speed'] is not None:
+                        vel_ms = streams['orbital_speed']()
+                except Exception:
+                    pass
+
+                info_data = {
+                    'alt_km': alt_km,
+                    'period': period,
+                    'inc': inc,
+                    'ecc': ecc,
+                    'vel_ms': vel_ms,
+                }
+
+                obj = self.render_objects[vid]
+                obj['orbit_pts'] = rotated
+                obj['pos_3d'] = (sx, sy, sz)
+                obj['info_data'] = info_data
+
+                buf = obj['trail_buf']
+                head = obj['trail_head']
+                buf[head] = [sx, sy, sz]
+                obj['trail_head'] = (head + 1) % TRAIL_LEN
+                if not obj['trail_filled'] and head == TRAIL_LEN - 1:
+                    obj['trail_filled'] = True
+
+                if obj['trail_filled']:
+                    idx = obj['trail_head']
+                    ordered = np.roll(buf, -idx, axis=0)
+                else:
+                    ordered = buf[:head + 1] if head > 0 else buf[:1]
+
+                obj['ordered_trail'] = ordered
+
+                if self.selected_vessel == vid:
+                    self._update_info_panel(vid)
+                    self._focus_camera_on(vid, initial=False)
+
                 self._update_selection_visuals()
 
             except Exception as e:
-                self.timer.stop()
-                self._clear_all_vessels()
-                QMessageBox.warning(
-                    self,
-                    "Conexión perdida",
-                    f"Se ha perdido la conexión con KSP.\nDetalle: {e}"
-                )
-                self.back_clicked.emit()
+                self._handle_update_error(e)
+
+        def _handle_update_error(self, e):
+            self.timer.stop()
+            self._clear_all_vessels()
+            QMessageBox.warning(
+                self,
+                "Conexión perdida",
+                f"Se ha perdido la conexión con KSP.\nDetalle: {e}"
+            )
+            self.back_clicked.emit()
 
         def _mouse_press(self, event):
             if event.button() == Qt.MouseButton.LeftButton:
