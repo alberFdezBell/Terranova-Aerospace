@@ -164,6 +164,22 @@ DEFAULT_SATELLITE_GROUPS = {
         "max_alt_km": None,
         "system": True,
     },
+    "ESTACIONES ESPACIALES": {
+        "name": "ESTACIONES ESPACIALES",
+        "full_name": "Estaciones Espaciales",
+        "description": "Objetos con icono de estación espacial",
+        "min_alt_km": None,
+        "max_alt_km": None,
+        "system": True,
+    },
+    "BASURA ESPACIAL": {
+        "name": "BASURA ESPACIAL",
+        "full_name": "Basura Espacial",
+        "description": "Objetos con icono de basura espacial",
+        "min_alt_km": None,
+        "max_alt_km": None,
+        "system": True,
+    },
 }
 
 
@@ -557,26 +573,38 @@ class CommandCenter(QWidget):
         header_layout.setSpacing(0)
 
         logo = LogoLabel(QSize(460, 170))
-        header_layout.addWidget(logo, 1, alignment=Qt.AlignmentFlag.AlignCenter)
+        header_layout.addWidget(
+            logo,
+            1,
+            alignment=Qt.AlignmentFlag.AlignCenter
+        )
+
         self.save_context_card = QFrame()
         self.save_context_card.setObjectName("saveContextCard")
         self.save_context_card.setFixedWidth(300)
+
         save_layout = QVBoxLayout(self.save_context_card)
         save_layout.setContentsMargins(14, 12, 14, 12)
         save_layout.setSpacing(4)
+
         self.save_context_title = QLabel("Partida activa")
         self.save_context_title.setObjectName("status")
         self.save_context_title.setAlignment(Qt.AlignmentFlag.AlignLeft)
+
         self.save_context_value = QLabel("Detectando save...")
         self.save_context_value.setWordWrap(True)
-        self.save_context_value.setStyleSheet("color: #dce9f6; font-size: 13px; font-weight: 700;")
-        self.save_context_meta = QLabel("")
-        self.save_context_meta.setWordWrap(True)
-        self.save_context_meta.setObjectName("muted")
+        self.save_context_value.setStyleSheet(
+            "color: #dce9f6; font-size: 13px; font-weight: 700;"
+        )
+
         save_layout.addWidget(self.save_context_title)
         save_layout.addWidget(self.save_context_value)
-        save_layout.addWidget(self.save_context_meta)
-        header_layout.addWidget(self.save_context_card, alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+
+        header_layout.addWidget(
+            self.save_context_card,
+            alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop
+        )
+
         content_layout.addWidget(header)
 
         grid_container = QWidget()
@@ -584,10 +612,14 @@ class CommandCenter(QWidget):
         self.grid.setHorizontalSpacing(18)
         self.grid.setVerticalSpacing(18)
         self.grid.setContentsMargins(0, 0, 0, 0)
+
         self.module_cards: list[ModuleCard] = []
+
         for index, (name, target) in enumerate(MODULES.items()):
             card = ModuleCard(name, bool(target))
-            card.clicked.connect(lambda checked=False, module=name: self.on_module_selected(module))
+            card.clicked.connect(
+                lambda checked=False, module=name: self.on_module_selected(module)
+            )
             self.module_cards.append(card)
             row, col = divmod(index, 3)
             self.grid.addWidget(card, row, col)
@@ -595,21 +627,24 @@ class CommandCenter(QWidget):
         self.grid.setColumnStretch(0, 1)
         self.grid.setColumnStretch(1, 1)
         self.grid.setColumnStretch(2, 1)
+
         content_layout.addWidget(grid_container)
         content_layout.addStretch()
 
         scroll.setWidget(content)
         root.addWidget(scroll)
+
         self.scroll_area = scroll
         self.grid_container = grid_container
+
         self._relayout_cards()
 
     def _refresh_active_save_context(self) -> None:
         context = _active_ksp_save_context()
+
         if context is None:
             self._active_save_context = None
             self.save_context_value.setText("Sin partida detectada")
-            self.save_context_meta.setText("Abre un save en KSP para mostrarlo aquí.")
             self.save_context_card.setProperty("state", "empty")
             self.save_context_card.style().unpolish(self.save_context_card)
             self.save_context_card.style().polish(self.save_context_card)
@@ -619,11 +654,10 @@ class CommandCenter(QWidget):
             return
 
         self._active_save_context = context
+
         save_name = context.get("save_name", "Desconocido")
-        save_path = context.get("save_path", "")
-        short_uid = str(context.get("save_uid", ""))[:8].upper()
         self.save_context_value.setText(save_name)
-        self.save_context_meta.setText(f"ID {short_uid} · {save_path}")
+
         self.save_context_card.setProperty("state", "active")
         self.save_context_card.style().unpolish(self.save_context_card)
         self.save_context_card.style().polish(self.save_context_card)
@@ -635,15 +669,19 @@ class CommandCenter(QWidget):
     def _relayout_cards(self) -> None:
         if not hasattr(self, "grid") or not hasattr(self, "module_cards"):
             return
+
         width = max(1, self.width())
         columns = 1 if width < 760 else 2 if width < 1080 else 3
+
         while self.grid.count():
             item = self.grid.takeAt(0)
             if item and item.widget():
                 item.widget().setParent(None)
+
         for index, card in enumerate(self.module_cards):
             row, col = divmod(index, columns)
             self.grid.addWidget(card, row, col)
+
         for col in range(columns):
             self.grid.setColumnStretch(col, 1)
 
@@ -943,6 +981,14 @@ class SatelliteStore:
         ]
         return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
 
+    def _groups_for_vessel_type(self, vessel_type_name: str) -> list[str]:
+        key = str(vessel_type_name).strip().lower()
+        if key == "station":
+            return ["ESTACIONES ESPACIALES"]
+        if key in {"debris", "dropped_part"}:
+            return ["BASURA ESPACIAL"]
+        return []
+
     def _default_game_payload(self, game_uid: str, save_name: str = "", save_path: str = "", install_root: str = "") -> dict:
         return {
             "game_uid": game_uid,
@@ -1173,6 +1219,8 @@ class SatelliteStore:
                 apoapsis_km = max(0.0, float(getattr(orbit, "apoapsis_altitude", 0.0) or 0.0) / 1000.0)
                 launch_ut = self._launch_ut_for_vessel(vessel)
                 name = str(getattr(vessel, "name", "")).strip()
+                vessel_type_obj = getattr(vessel, "type", None)
+                vessel_type_name = str(getattr(vessel_type_obj, "name", vessel_type_obj) or "").strip().lower()
                 orbit_payload = {
                     "periapsis_km": round(periapsis_km, 3),
                     "apoapsis_km": round(apoapsis_km, 3),
@@ -1188,6 +1236,7 @@ class SatelliteStore:
                     "period_s": orbit_payload["period_s"],
                     "eccentricity": orbit_payload["eccentricity"],
                     "launch_ut": launch_ut,
+                    "vessel_type": vessel_type_name,
                     "identity_key": self._satellite_key(name, launch_ut, orbit_payload),
                 })
             except Exception:
@@ -1308,7 +1357,10 @@ class SatelliteStore:
             key = str(sat["identity_key"])
             current_keys.add(key)
             altitude_for_group = max(0.0, (sat["periapsis_km"] + sat["apoapsis_km"]) / 2.0)
-            default_group = _auto_group_for_altitude(altitude_for_group)
+            default_groups = self._unique_groups([
+                _auto_group_for_altitude(altitude_for_group),
+                *self._groups_for_vessel_type(sat.get("vessel_type", "")),
+            ])
             launch_ut = sat.get("launch_ut")
             if launch_ut is None:
                 try:
@@ -1324,10 +1376,10 @@ class SatelliteStore:
                     "ksp_identity_key": key,
                     "name": sat["name"],
                     "description": "",
-                    "groups_auto": [default_group],
+                    "groups_auto": default_groups,
                     "groups_manual": [],
-                    "groups": [default_group],
-                    "group": default_group,
+                    "groups": default_groups,
+                    "group": default_groups[0] if default_groups else "",
                     "group_manual": False,
                     "orbit": {},
                     "launch_ut": launch_ut,
@@ -1361,8 +1413,8 @@ class SatelliteStore:
             if record.get("orbit") != orbit_payload:
                 record["orbit"] = orbit_payload
                 changed = True
-            if record.get("groups_auto") != [default_group]:
-                record["groups_auto"] = [default_group]
+            if record.get("groups_auto") != default_groups:
+                record["groups_auto"] = default_groups
                 changed = True
             record["ksp_identity_key"] = key
             self._sync_group_fields(record)
