@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import json
 import math
+import mimetypes
 import os
 import random
 import re
@@ -26,9 +27,9 @@ from PyQt6.QtCore import QPointF
 from PyQt6.QtGui import QMouseEvent
 from PySide6.QtCore import QVariantAnimation
 
-from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, QRect, QSize, Qt, QTimer, QThread, pyqtSignal
+from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, QRect, QSize, Qt, QTimer, QThread, pyqtSignal, QDate
 from PyQt6.QtCore import QUrl
-from PyQt6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap, QPalette, QFont, QCursor, QVector3D, QFontMetrics, QBrush
+from PyQt6.QtGui import QAction, QColor, QDesktopServices, QIcon, QPainter, QPen, QPixmap, QPalette, QFont, QCursor, QVector3D, QFontMetrics, QBrush
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -52,10 +53,12 @@ from PyQt6.QtWidgets import (
     QScrollArea,
     QSpinBox,
     QSizePolicy,
+    QDateEdit,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
     QStackedWidget,
+    QMenu,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -70,6 +73,15 @@ except Exception:
     QMediaPlayer = None  # type: ignore
     QVideoWidget = None  # type: ignore
     _MULTIMEDIA_AVAILABLE = False
+
+try:
+    from PyQt6.QtPdf import QPdfDocument
+    from PyQt6.QtPdfWidgets import QPdfView
+    _PDF_AVAILABLE = True
+except Exception:
+    QPdfDocument = None  # type: ignore
+    QPdfView = None  # type: ignore
+    _PDF_AVAILABLE = False
 
 # Importación condicional del módulo orbital (requiere krpc, pyqtgraph, numpy)
 try:
@@ -95,7 +107,7 @@ HASH_ITERATIONS = 240_000
 
 MODULES: dict[str, str | None] = {
     "Mapa orbital": "internal",
-    "Notas de prensa": None,
+    "Notas de prensa": "internal",
     "Lista de satélites": "internal",
     "Programación": None,
     "Centro de mando": None,
@@ -123,6 +135,12 @@ SATELLITES_FILE = CONFIG_DIR / "satellites.dat"
 SATELLITES_GROUPS_FILE = CONFIG_DIR / "satellite_groups.dat"
 SATELLITES_GAMES_FILE = CONFIG_DIR / "satellite_games.dat"
 SATELLITES_MEDIA_DIR = CONFIG_DIR / "satellite_media"
+PRESS_DIR = CONFIG_DIR / "press"
+PRESS_FILE = PRESS_DIR / "notes.json"
+PRESS_MEDIA_DIR = PRESS_DIR / "media"
+PRESS_MEDIA_IMAGES_DIR = PRESS_MEDIA_DIR / "images"
+PRESS_MEDIA_VIDEOS_DIR = PRESS_MEDIA_DIR / "videos"
+PRESS_MEDIA_DOCUMENTS_DIR = PRESS_MEDIA_DIR / "documents"
 KSP_USER_DIR = Path(os.environ.get("USERPROFILE", "")) / "AppData" / "LocalLow" / "Squad" / "Kerbal Space Program"
 KSP_PLAYER_LOG = KSP_USER_DIR / "Player.log"
 KSP_PLAYER_PREV_LOG = KSP_USER_DIR / "Player-prev.log"
@@ -189,8 +207,24 @@ def apply_shadow(widget: QWidget, blur: int = 28, alpha: int = 90) -> None:
 
 
 def fade_in(widget: QWidget, duration: int = 700) -> None:
-    effect = QGraphicsOpacityEffect(widget)
-    widget.setGraphicsEffect(effect)
+    # Los widgets embebidos en la pila principal suelen contener pintura activa
+    # o timers; en ellos la opacidad por efecto de Qt puede generar conflictos
+    # de QPainter. Limitamos la animación de opacidad a ventanas reales.
+    if not widget.isWindow():
+        widget._fade_animation = None
+        return
+    current_effect = widget.graphicsEffect()
+    if isinstance(current_effect, QGraphicsOpacityEffect):
+        effect = current_effect
+    else:
+        effect = QGraphicsOpacityEffect(widget)
+        widget.setGraphicsEffect(effect)
+    previous = getattr(widget, "_fade_animation", None)
+    if previous is not None:
+        try:
+            previous.stop()
+        except Exception:
+            pass
     animation = QPropertyAnimation(effect, b"opacity", widget)
     animation.setDuration(duration)
     animation.setStartValue(0.0)
@@ -201,9 +235,22 @@ def fade_in(widget: QWidget, duration: int = 700) -> None:
 
 
 def fade_out(widget: QWidget, finished, duration: int = 420) -> None:
-    effect = QGraphicsOpacityEffect(widget)
-    widget.setGraphicsEffect(effect)
+    if not widget.isWindow():
+        QTimer.singleShot(duration, finished)
+        return
+    current_effect = widget.graphicsEffect()
+    if isinstance(current_effect, QGraphicsOpacityEffect):
+        effect = current_effect
+    else:
+        effect = QGraphicsOpacityEffect(widget)
+        widget.setGraphicsEffect(effect)
     effect.setOpacity(1.0)
+    previous = getattr(widget, "_fade_animation", None)
+    if previous is not None:
+        try:
+            previous.stop()
+        except Exception:
+            pass
     animation = QPropertyAnimation(effect, b"opacity", widget)
     animation.setDuration(duration)
     animation.setStartValue(1.0)
@@ -702,6 +749,1666 @@ class ModuleTransitionScreen(QWidget):
     def _launch(self, on_launch) -> None:
         self.message_timer.stop()
         on_launch(self.module_name, self.target_file)
+
+
+def _press_date_sort_key(value: str) -> tuple[int, int, int, int]:
+    date_obj = QDate.fromString(value, "yyyy-MM-dd")
+    if not date_obj.isValid():
+        date_obj = QDate.fromString(value, "dd/MM/yyyy")
+    if not date_obj.isValid():
+        return (0, 0, 0, 0)
+    return (date_obj.year(), date_obj.month(), date_obj.day(), 1)
+
+
+def _press_plain_text_from_html(html: str) -> str:
+    text = re.sub(r"<br\s*/?>", "\n", html, flags=re.IGNORECASE)
+    text = re.sub(r"</p\s*>", "\n\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"&nbsp;", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+\n", "\n", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    return text.strip()
+
+
+def _press_summary_from_blocks(blocks: list[dict], limit: int = 140) -> str:
+    for block in blocks:
+        if str(block.get("type", "")).strip() != "text":
+            continue
+        plain = str(block.get("plain") or _press_plain_text_from_html(str(block.get("html") or ""))).strip()
+        if plain:
+            return _shorten_text(plain.replace("\n", " "), limit)
+    return "Sin resumen disponible."
+
+
+def _press_media_kind_for_path(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix in {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"}:
+        return "image"
+    if suffix in {".mp4", ".mov", ".mkv", ".webm", ".avi"}:
+        return "video"
+    return "document"
+
+
+def _press_relativize_path(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(BASE_DIR))
+    except Exception:
+        return str(path.resolve())
+
+
+class PressStore:
+    def __init__(self, notes_file: Path = PRESS_FILE):
+        self.notes_file = notes_file
+        self.notes: list[dict] = []
+        self.next_id = 1
+        self.load()
+
+    def _ensure_structure(self) -> None:
+        for folder in (PRESS_DIR, PRESS_MEDIA_DIR, PRESS_MEDIA_IMAGES_DIR, PRESS_MEDIA_VIDEOS_DIR, PRESS_MEDIA_DOCUMENTS_DIR):
+            folder.mkdir(parents=True, exist_ok=True)
+
+    def load(self) -> None:
+        self._ensure_structure()
+        payload = _load_json_file(self.notes_file, {})
+        self.next_id = int(payload.get("next_id", 1)) if isinstance(payload, dict) else 1
+        raw_notes = payload.get("notes", []) if isinstance(payload, dict) else []
+        self.notes = []
+        if isinstance(raw_notes, list):
+            for entry in raw_notes:
+                if isinstance(entry, dict):
+                    self.notes.append(entry)
+        self._normalize_notes(import_media=False)
+
+    def save(self) -> None:
+        self._ensure_structure()
+        self._normalize_notes(import_media=True)
+        _save_json_file(self.notes_file, {
+            "next_id": self.next_id,
+            "notes": self.notes,
+        })
+        self._prune_unused_media()
+
+    def _allocate_id(self) -> int:
+        note_id = int(self.next_id)
+        self.next_id += 1
+        return note_id
+
+    def get_note(self, note_id: int) -> dict | None:
+        for note in self.notes:
+            if int(note.get("id", 0)) == int(note_id):
+                return note
+        return None
+
+    def upsert_note(self, payload: dict) -> dict:
+        note_id = int(payload.get("id") or 0)
+        if note_id <= 0:
+            note_id = self._allocate_id()
+        existing = self.get_note(note_id)
+        if existing is None:
+            existing = {"id": note_id, "created_at": time.time()}
+            self.notes.append(existing)
+        existing.update(payload)
+        existing["id"] = note_id
+        existing.setdefault("created_at", time.time())
+        existing["updated_at"] = time.time()
+        self.save()
+        return existing
+
+    def delete_note(self, note_id: int) -> bool:
+        before = len(self.notes)
+        self.notes = [note for note in self.notes if int(note.get("id", 0)) != int(note_id)]
+        if len(self.notes) == before:
+            return False
+        self.save()
+        return True
+
+    def query_notes(self, text: str = "") -> list[dict]:
+        term = _normalize_key(text)
+        notes = [dict(note) for note in self.notes]
+        if term:
+            notes = [note for note in notes if self._matches_query(note, term)]
+        notes.sort(key=self._sort_key, reverse=True)
+        return notes
+
+    def _matches_query(self, note: dict, term: str) -> bool:
+        haystack = " ".join([
+            str(note.get("title", "")),
+            str(note.get("author", "")),
+            str(note.get("date", "")),
+            str(note.get("importance", "")),
+            _press_summary_from_blocks(list(note.get("blocks", []) or [])),
+        ])
+        return term in _normalize_key(haystack)
+
+    def _sort_key(self, note: dict) -> tuple:
+        date_key = _press_date_sort_key(str(note.get("date", "")))
+        updated = float(note.get("updated_at") or note.get("created_at") or 0.0)
+        return (*date_key, updated, int(note.get("id", 0)))
+
+    def _normalize_notes(self, import_media: bool) -> None:
+        normalized: list[dict] = []
+        max_id = 0
+        for note in self.notes:
+            note_id = int(note.get("id") or 0)
+            if note_id <= 0:
+                note_id = self._allocate_id()
+            max_id = max(max_id, note_id)
+            blocks = self._normalize_blocks(note_id, list(note.get("blocks", []) or []), import_media=import_media)
+            normalized.append({
+                "id": note_id,
+                "title": str(note.get("title", "")).strip(),
+                "author": str(note.get("author", "")).strip(),
+                "date": self._normalize_date(str(note.get("date", "")).strip()),
+                "importance": str(note.get("importance", "")).strip(),
+                "blocks": blocks,
+                "summary": str(note.get("summary") or _press_summary_from_blocks(blocks)),
+                "created_at": float(note.get("created_at") or time.time()),
+                "updated_at": float(note.get("updated_at") or note.get("created_at") or time.time()),
+            })
+        self.notes = sorted(normalized, key=self._sort_key, reverse=True)
+        if self.next_id <= max_id:
+            self.next_id = max_id + 1
+
+    def _normalize_date(self, value: str) -> str:
+        if not value:
+            return QDate.currentDate().toString("yyyy-MM-dd")
+        for fmt in ("yyyy-MM-dd", "dd/MM/yyyy", "d/M/yyyy", "dd-MM-yyyy"):
+            date_obj = QDate.fromString(value, fmt)
+            if date_obj.isValid():
+                return date_obj.toString("yyyy-MM-dd")
+        date_obj = QDate.currentDate()
+        return date_obj.toString("yyyy-MM-dd")
+
+    def _media_target_dir(self, media_type: str) -> Path:
+        if media_type == "image":
+            return PRESS_MEDIA_IMAGES_DIR
+        if media_type == "video":
+            return PRESS_MEDIA_VIDEOS_DIR
+        return PRESS_MEDIA_DOCUMENTS_DIR
+
+    def _import_media_file(self, note_id: int, source_path: str, media_type: str) -> str:
+        source = Path(source_path)
+        if not source.exists():
+            return source_path
+        source = source.resolve()
+        try:
+            if source.is_relative_to(PRESS_DIR):
+                return _press_relativize_path(source)
+        except Exception:
+            pass
+        target_dir = self._media_target_dir(media_type)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        suffix = source.suffix.lower()
+        stem = _normalize_key(source.stem) or f"note_{note_id}"
+        destination = target_dir / f"{stem}_{note_id}_{uuid.uuid4().hex[:10]}{suffix}"
+        shutil.copy2(source, destination)
+        return _press_relativize_path(destination)
+
+    def _normalize_blocks(self, note_id: int, blocks: list[dict], import_media: bool) -> list[dict]:
+        normalized: list[dict] = []
+        for block in blocks:
+            block_type = str(block.get("type", "")).strip().lower()
+            if block_type == "text":
+                html = str(block.get("html") or "")
+                plain = str(block.get("plain") or _press_plain_text_from_html(html))
+                if not html.strip() and not plain.strip():
+                    continue
+                normalized.append({"type": "text", "html": html, "plain": plain})
+                continue
+            if block_type == "carousel":
+                items: list[dict] = []
+                for entry in list(block.get("items", []) or []):
+                    raw_path = str(entry.get("path", "")).strip()
+                    if not raw_path:
+                        continue
+                    resolved = _resolve_press_path(raw_path)
+                    if resolved.exists() and import_media:
+                        raw_path = self._import_media_file(note_id, str(resolved), "image")
+                    elif resolved.is_absolute():
+                        raw_path = _press_relativize_path(resolved)
+                    label = str(entry.get("label") or resolved.stem or "Imagen").strip()
+                    items.append({"path": raw_path, "label": label})
+                normalized.append({
+                    "type": "carousel",
+                    "label": str(block.get("label") or "Carrusel").strip(),
+                    "items": items,
+                })
+                continue
+            raw_path = str(block.get("path", "")).strip()
+            if not raw_path:
+                continue
+            resolved = _resolve_press_path(raw_path)
+            media_type = "image" if block_type == "image" else "video" if block_type == "video" else "document"
+            if resolved.exists() and import_media:
+                raw_path = self._import_media_file(note_id, str(resolved), media_type)
+            elif resolved.is_absolute():
+                raw_path = _press_relativize_path(resolved)
+            normalized.append({
+                "type": media_type,
+                "path": raw_path,
+                "label": str(block.get("label") or resolved.stem or "Archivo").strip(),
+            })
+        return normalized
+
+    def _iter_media_paths(self) -> set[Path]:
+        paths: set[Path] = set()
+        for note in self.notes:
+            for block in list(note.get("blocks", []) or []):
+                if block.get("type") == "carousel":
+                    for item in list(block.get("items", []) or []):
+                        self._collect_media_path(paths, str(item.get("path", "")))
+                else:
+                    self._collect_media_path(paths, str(block.get("path", "")))
+        return paths
+
+    def _collect_media_path(self, paths: set[Path], value: str) -> None:
+        if not value:
+            return
+        path = Path(value)
+        if not path.is_absolute():
+            path = (BASE_DIR / path).resolve()
+        if PRESS_DIR in path.parents or path.parent == PRESS_DIR:
+            paths.add(path)
+
+    def _prune_unused_media(self) -> None:
+        referenced = self._iter_media_paths()
+        for directory in (PRESS_MEDIA_IMAGES_DIR, PRESS_MEDIA_VIDEOS_DIR, PRESS_MEDIA_DOCUMENTS_DIR):
+            if not directory.exists():
+                continue
+            for file_path in directory.rglob("*"):
+                if file_path.is_file() and file_path.resolve() not in referenced:
+                    try:
+                        file_path.unlink()
+                    except Exception:
+                        pass
+
+
+def _resolve_press_path(value: str) -> Path:
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    return (BASE_DIR / path).resolve()
+
+
+class PressTextEdit(QTextEdit):
+    activated = pyqtSignal(object)
+
+    def focusInEvent(self, event) -> None:
+        self.activated.emit(self)
+        super().focusInEvent(event)
+
+
+class PressTextBlockWidget(QFrame):
+    activated = pyqtSignal(object)
+    remove_requested = pyqtSignal(object)
+    insert_requested = pyqtSignal(str)
+
+    def __init__(self, html: str = "", parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("pressBlock")
+        self.setProperty("kind", "text")
+        self._build_ui(html)
+
+    def _build_ui(self, html: str) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(8)
+        title = QLabel("Bloque de texto")
+        title.setObjectName("status")
+        header.addWidget(title)
+        header.addStretch()
+        insert_btn = QPushButton("Insertar")
+        insert_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        insert_btn.clicked.connect(lambda: self.insert_requested.emit("text"))
+        remove_btn = QPushButton("Eliminar")
+        remove_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        remove_btn.clicked.connect(lambda: self.remove_requested.emit(self))
+        header.addWidget(insert_btn)
+        header.addWidget(remove_btn)
+        layout.addLayout(header)
+
+        self.editor = PressTextEdit()
+        self.editor.setAcceptRichText(True)
+        self.editor.setPlaceholderText("Escribe el contenido de la nota...")
+        self.editor.setMinimumHeight(160)
+        self.editor.activated.connect(lambda _: self.activated.emit(self))
+        if html:
+            self.editor.setHtml(html)
+        layout.addWidget(self.editor)
+
+    def set_html(self, html: str) -> None:
+        if html:
+            self.editor.setHtml(html)
+        else:
+            self.editor.setPlainText("")
+
+    def html(self) -> str:
+        return self.editor.toHtml()
+
+    def plain_text(self) -> str:
+        return self.editor.toPlainText()
+
+    def split_at_cursor(self) -> tuple[str, str]:
+        text = self.editor.toPlainText()
+        cursor = self.editor.textCursor()
+        position = max(0, min(cursor.position(), len(text)))
+        return text[:position], text[position:]
+
+
+class PressMediaBlockWidget(QFrame):
+    activated = pyqtSignal(object)
+    remove_requested = pyqtSignal(object)
+    replace_requested = pyqtSignal(object)
+
+    def __init__(self, block_type: str, data: dict | None = None, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.block_type = block_type
+        self.setObjectName("pressBlock")
+        self.setProperty("kind", block_type)
+        self._build_ui()
+        if data:
+            self.set_data(data)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.activated.emit(self)
+        super().mousePressEvent(event)
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(8)
+        self.kind_label = QLabel(self._kind_title())
+        self.kind_label.setObjectName("status")
+        header.addWidget(self.kind_label)
+        header.addStretch()
+        replace_btn = QPushButton("Cambiar")
+        replace_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        replace_btn.clicked.connect(lambda: self.replace_requested.emit(self))
+        remove_btn = QPushButton("Eliminar")
+        remove_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        remove_btn.clicked.connect(lambda: self.remove_requested.emit(self))
+        header.addWidget(replace_btn)
+        header.addWidget(remove_btn)
+        layout.addLayout(header)
+
+        self.preview = QLabel()
+        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview.setMinimumHeight(120)
+        self.preview.setWordWrap(True)
+        layout.addWidget(self.preview)
+
+        form = QGridLayout()
+        form.setHorizontalSpacing(10)
+        form.setVerticalSpacing(8)
+        form.addWidget(QLabel("Etiqueta"), 0, 0)
+        self.label_edit = QLineEdit()
+        self.label_edit.setPlaceholderText("Título opcional del bloque")
+        form.addWidget(self.label_edit, 0, 1)
+        form.addWidget(QLabel("Archivo"), 1, 0)
+        self.path_label = QLabel("")
+        self.path_label.setWordWrap(True)
+        self.path_label.setObjectName("muted")
+        form.addWidget(self.path_label, 1, 1)
+        layout.addLayout(form)
+
+    def _kind_title(self) -> str:
+        return {
+            "image": "Imagen",
+            "video": "Vídeo",
+            "document": "Documento",
+        }.get(self.block_type, "Archivo")
+
+    def set_data(self, data: dict) -> None:
+        self.label_edit.setText(str(data.get("label") or ""))
+        path = str(data.get("path") or "")
+        self.path_label.setText(path)
+        self._update_preview(path)
+
+    def _update_preview(self, path: str) -> None:
+        resolved = _resolve_press_path(path) if path else Path()
+        if self.block_type == "image" and path and resolved.exists():
+            pix = QPixmap(str(resolved))
+            if not pix.isNull():
+                self.preview.setPixmap(pix.scaledToWidth(360, Qt.TransformationMode.SmoothTransformation))
+                return
+        self.preview.setPixmap(QPixmap())
+        if self.block_type == "video":
+            self.preview.setText("Vídeo adjunto")
+        elif self.block_type == "document":
+            self.preview.setText("Documento adjunto")
+        else:
+            self.preview.setText("Archivo adjunto")
+
+    def block_data(self) -> dict:
+        return {
+            "type": self.block_type,
+            "path": self.path_label.text().strip(),
+            "label": self.label_edit.text().strip(),
+        }
+
+
+class PressCarouselBlockWidget(QFrame):
+    activated = pyqtSignal(object)
+    remove_requested = pyqtSignal(object)
+    replace_requested = pyqtSignal(object)
+
+    def __init__(self, data: dict | None = None, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("pressBlock")
+        self.setProperty("kind", "carousel")
+        self.items: list[dict] = []
+        self.index = 0
+        self._player = None
+        self._audio = None
+        self._build_ui()
+        if data:
+            self.set_data(data)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.activated.emit(self)
+        super().mousePressEvent(event)
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(8)
+        self.kind_label = QLabel("Carrusel de imágenes")
+        self.kind_label.setObjectName("status")
+        header.addWidget(self.kind_label)
+        header.addStretch()
+        replace_btn = QPushButton("Cambiar")
+        replace_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        replace_btn.clicked.connect(lambda: self.replace_requested.emit(self))
+        remove_btn = QPushButton("Eliminar")
+        remove_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        remove_btn.clicked.connect(lambda: self.remove_requested.emit(self))
+        header.addWidget(replace_btn)
+        header.addWidget(remove_btn)
+        layout.addLayout(header)
+
+        self.title_edit = QLineEdit()
+        self.title_edit.setPlaceholderText("Título del carrusel")
+        layout.addWidget(self.title_edit)
+
+        self.viewer_stack = QStackedWidget()
+        self.viewer_stack.setMinimumHeight(220)
+        self.viewer_stack.setStyleSheet("background: rgba(7, 16, 25, 180); border-radius: 10px;")
+        self.image_label = QLabel("Sin imágenes")
+        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image_label.setWordWrap(True)
+        self.viewer_stack.addWidget(self.image_label)
+        layout.addWidget(self.viewer_stack)
+
+        nav = QHBoxLayout()
+        self.prev_btn = QPushButton("Anterior")
+        self.prev_btn.clicked.connect(self._previous)
+        self.next_btn = QPushButton("Siguiente")
+        self.next_btn.clicked.connect(self._next)
+        self.counter_label = QLabel("")
+        self.counter_label.setObjectName("muted")
+        nav.addWidget(self.prev_btn)
+        nav.addWidget(self.next_btn)
+        nav.addStretch()
+        nav.addWidget(self.counter_label)
+        layout.addLayout(nav)
+
+        self._gallery = QHBoxLayout()
+        meta = QGridLayout()
+        meta.setHorizontalSpacing(10)
+        meta.setVerticalSpacing(8)
+        meta.addWidget(QLabel("Etiquetas"), 0, 0)
+        self.summary_label = QLabel("")
+        self.summary_label.setWordWrap(True)
+        self.summary_label.setObjectName("muted")
+        meta.addWidget(self.summary_label, 0, 1)
+        layout.addLayout(meta)
+
+    def set_data(self, data: dict) -> None:
+        self.title_edit.setText(str(data.get("label") or "Carrusel"))
+        self.items = [dict(item) for item in list(data.get("items", []) or [])]
+        self.index = 0
+        self._show_current()
+
+    def block_data(self) -> dict:
+        return {
+            "type": "carousel",
+            "label": self.title_edit.text().strip(),
+            "items": [
+                {
+                    "path": str(item.get("path", "")).strip(),
+                    "label": str(item.get("label", "")).strip(),
+                }
+                for item in self.items
+                if str(item.get("path", "")).strip()
+            ],
+        }
+
+    def _current_item(self) -> dict | None:
+        if not self.items:
+            return None
+        self.index %= len(self.items)
+        return self.items[self.index]
+
+    def _show_current(self) -> None:
+        item = self._current_item()
+        if item is None:
+            self.counter_label.setText("0/0")
+            self.image_label.setText("Sin imágenes")
+            self.viewer_stack.setCurrentWidget(self.image_label)
+            self.summary_label.setText("")
+            return
+        path = str(item.get("path", ""))
+        label = str(item.get("label") or Path(path).stem or "Imagen")
+        self.summary_label.setText(", ".join([str(entry.get("label") or Path(str(entry.get("path", ""))).stem) for entry in self.items]))
+        self.counter_label.setText(f"{self.index + 1}/{len(self.items)} · {label}")
+        resolved = _resolve_press_path(path)
+        if resolved.exists():
+            pix = QPixmap(str(resolved))
+            if not pix.isNull():
+                self.image_label.setPixmap(pix.scaled(
+                    self.viewer_stack.size().expandedTo(QSize(700, 260)),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                ))
+                self.viewer_stack.setCurrentWidget(self.image_label)
+                return
+        self.image_label.setText("No se pudo cargar la imagen.")
+        self.viewer_stack.setCurrentWidget(self.image_label)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self.items and self.viewer_stack.currentWidget() == self.image_label and self.image_label.pixmap() is not None:
+            self._show_current()
+
+    def _previous(self) -> None:
+        if self.items:
+            self.index = (self.index - 1) % len(self.items)
+            self._show_current()
+
+    def _next(self) -> None:
+        if self.items:
+            self.index = (self.index + 1) % len(self.items)
+            self._show_current()
+
+
+class PressBlockEditor(QWidget):
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.current_block: QWidget | None = None
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setSpacing(12)
+        root.setContentsMargins(0, 0, 0, 0)
+
+        tools = QHBoxLayout()
+        tools.setSpacing(8)
+        for label, kind in [("Texto", "text"), ("Imagen", "image"), ("Carrusel", "carousel"), ("Vídeo", "video"), ("Documento", "document")]:
+            btn = QPushButton(label)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda _=False, media_kind=kind: self.insert_media(media_kind))
+            tools.addWidget(btn)
+        tools.addStretch()
+        root.addLayout(tools)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("background: transparent; border: none;")
+        self.container = QWidget()
+        self.blocks_layout = QVBoxLayout(self.container)
+        self.blocks_layout.setContentsMargins(0, 0, 0, 0)
+        self.blocks_layout.setSpacing(12)
+        self.blocks_layout.addStretch()
+        scroll.setWidget(self.container)
+        root.addWidget(scroll)
+        self.scroll_area = scroll
+        self.ensure_text_block()
+
+    def clear(self) -> None:
+        while self.blocks_layout.count():
+            item = self.blocks_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+        self.blocks_layout.addStretch()
+        self.current_block = None
+
+    def ensure_text_block(self) -> None:
+        if self.count_content_blocks() == 0:
+            self.add_text_block("", focus=True)
+
+    def count_content_blocks(self) -> int:
+        count = 0
+        for index in range(self.blocks_layout.count()):
+            item = self.blocks_layout.itemAt(index)
+            if item and item.widget() is not None:
+                count += 1
+        return count
+
+    def _insert_widget_before_stretch(self, widget: QWidget, index: int | None = None) -> None:
+        stretch_index = max(0, self.blocks_layout.count() - 1)
+        if index is None or index >= stretch_index:
+            self.blocks_layout.insertWidget(stretch_index, widget)
+        else:
+            self.blocks_layout.insertWidget(index, widget)
+
+    def add_text_block(self, html: str = "", focus: bool = False, index: int | None = None) -> PressTextBlockWidget:
+        widget = PressTextBlockWidget(html)
+        widget.activated.connect(self._set_current)
+        widget.remove_requested.connect(self.remove_block)
+        widget.insert_requested.connect(self.insert_media)
+        self._insert_widget_before_stretch(widget, index)
+        if focus:
+            widget.editor.setFocus()
+        return widget
+
+    def add_media_block(self, block_type: str, data: dict, index: int | None = None) -> QWidget:
+        if block_type == "carousel":
+            widget = PressCarouselBlockWidget(data)
+        else:
+            widget = PressMediaBlockWidget(block_type, data)
+        widget.activated.connect(self._set_current)
+        widget.remove_requested.connect(self.remove_block)
+        widget.replace_requested.connect(self.replace_media)
+        self._insert_widget_before_stretch(widget, index)
+        return widget
+
+    def set_blocks(self, blocks: list[dict]) -> None:
+        self.clear()
+        if not blocks:
+            self.add_text_block("")
+            return
+        for block in blocks:
+            block_type = str(block.get("type", "")).strip().lower()
+            if block_type == "text":
+                self.add_text_block(str(block.get("html") or ""), focus=False)
+            elif block_type == "carousel":
+                self.add_media_block("carousel", block)
+            else:
+                self.add_media_block(block_type or "document", block)
+        self.ensure_text_block()
+
+    def blocks(self) -> list[dict]:
+        result: list[dict] = []
+        for index in range(self.blocks_layout.count()):
+            item = self.blocks_layout.itemAt(index)
+            widget = item.widget() if item else None
+            if isinstance(widget, PressTextBlockWidget):
+                text = widget.plain_text().strip()
+                html = widget.html() if text else ""
+                if not text and not html.strip():
+                    continue
+                result.append({"type": "text", "html": html, "plain": text})
+            elif isinstance(widget, PressCarouselBlockWidget):
+                block = widget.block_data()
+                if block["items"]:
+                    result.append(block)
+            elif isinstance(widget, PressMediaBlockWidget):
+                block = widget.block_data()
+                if block.get("path"):
+                    result.append(block)
+        return result
+
+    def _set_current(self, widget: QWidget) -> None:
+        self.current_block = widget
+
+    def _widget_index(self, widget: QWidget) -> int:
+        for index in range(self.blocks_layout.count()):
+            item = self.blocks_layout.itemAt(index)
+            if item and item.widget() is widget:
+                return index
+        return max(0, self.blocks_layout.count() - 1)
+
+    def remove_block(self, widget: QWidget) -> None:
+        index = self._widget_index(widget)
+        widget.setParent(None)
+        widget.deleteLater()
+        if self.count_content_blocks() == 0:
+            self.add_text_block("", focus=True)
+        elif isinstance(widget, PressTextBlockWidget) and self.count_content_blocks() == 1:
+            self.add_text_block("", focus=True)
+        else:
+            self.current_block = None
+
+    def replace_media(self, widget: QWidget) -> None:
+        if isinstance(widget, PressCarouselBlockWidget):
+            files, _ = QFileDialog.getOpenFileNames(
+                self,
+                "Reemplazar carrusel",
+                str(BASE_DIR),
+                "Imágenes (*.png *.jpg *.jpeg *.bmp *.gif *.webp);;Todos los archivos (*)",
+            )
+            if files:
+                widget.set_data({
+                    "label": widget.title_edit.text(),
+                    "items": [{"path": file_name, "label": Path(file_name).stem} for file_name in files],
+                })
+            return
+        media_type = getattr(widget, "block_type", "document")
+        filters = {
+            "image": "Imágenes (*.png *.jpg *.jpeg *.bmp *.gif *.webp);;Todos los archivos (*)",
+            "video": "Vídeos (*.mp4 *.mov *.mkv *.webm *.avi);;Todos los archivos (*)",
+        }.get(media_type, "Todos los archivos (*)")
+        file_name, _ = QFileDialog.getOpenFileName(self, "Seleccionar archivo", str(BASE_DIR), filters)
+        if file_name:
+            widget.set_data({"path": file_name, "label": Path(file_name).stem})
+
+    def _insert_after_current(self, widget: QWidget) -> int:
+        if self.current_block is None:
+            return max(0, self.blocks_layout.count() - 1)
+        index = self._widget_index(self.current_block)
+        self.blocks_layout.insertWidget(index + 1, widget)
+        return index + 1
+
+    def _split_text_block(self, block: PressTextBlockWidget) -> int:
+        before, after = block.split_at_cursor()
+        index = self._widget_index(block)
+        block.set_html(before)
+        if after.strip():
+            after_block = PressTextBlockWidget("")
+            after_block.set_html(after)
+            after_block.activated.connect(self._set_current)
+            after_block.remove_requested.connect(self.remove_block)
+            after_block.insert_requested.connect(self.insert_media)
+            self.blocks_layout.insertWidget(index + 1, after_block)
+        return index + 1
+
+    def insert_media(self, media_kind: str) -> None:
+        insert_index = None
+        if isinstance(self.current_block, PressTextBlockWidget):
+            insert_index = self._split_text_block(self.current_block)
+        elif self.current_block is not None:
+            insert_index = self._widget_index(self.current_block) + 1
+        if media_kind == "text":
+            self.add_text_block("", focus=True, index=insert_index)
+            return
+
+        if media_kind == "carousel":
+            files, _ = QFileDialog.getOpenFileNames(
+                self,
+                "Seleccionar imágenes del carrusel",
+                str(BASE_DIR),
+                "Imágenes (*.png *.jpg *.jpeg *.bmp *.gif *.webp);;Todos los archivos (*)",
+            )
+            if not files:
+                return
+            data = {"label": "Carrusel", "items": [{"path": file_name, "label": Path(file_name).stem} for file_name in files]}
+            self.add_media_block("carousel", data, index=insert_index)
+            return
+
+        filters = {
+            "image": "Imágenes (*.png *.jpg *.jpeg *.bmp *.gif *.webp);;Todos los archivos (*)",
+            "video": "Vídeos (*.mp4 *.mov *.mkv *.webm *.avi);;Todos los archivos (*)",
+            "document": "Documentos (*.pdf *.txt *.rtf *.doc *.docx *.odt *.md);;Todos los archivos (*)",
+        }
+        file_name, _ = QFileDialog.getOpenFileName(self, "Seleccionar archivo", str(BASE_DIR), filters.get(media_kind, "Todos los archivos (*)"))
+        if not file_name:
+            return
+        data = {"path": file_name, "label": Path(file_name).stem}
+        self.add_media_block(media_kind, data, index=insert_index)
+
+
+class PressEditorDialog(QDialog):
+    def __init__(self, store: PressStore, note: dict | None = None, parent: QWidget | None = None):
+        title = "Editar nota" if note else "Nueva nota"
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+        self.resize(920, 780)
+        self.setStyleSheet("QDialog { background: #07111d; }")
+        self.store = store
+        self.note = dict(note or {})
+        self.note_id = int(self.note.get("id", 0) or 0)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(14, 14, 14, 14)
+        self.panel = GlassPanel()
+        self.panel.setObjectName("modalPanel")
+        self.panel.setStyleSheet("""
+            QFrame#modalPanel {
+                background: #101d2c;
+                border: 1px solid rgba(126, 164, 196, 90);
+                border-radius: 14px;
+            }
+        """)
+        outer.addWidget(self.panel)
+
+        panel_layout = QVBoxLayout(self.panel)
+        panel_layout.setContentsMargins(18, 16, 18, 18)
+        panel_layout.setSpacing(14)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(10)
+        title_label = QLabel(title)
+        title_label.setObjectName("title")
+        header.addWidget(title_label)
+        header.addStretch()
+        close_button = QPushButton("Cerrar")
+        close_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_button.clicked.connect(self.reject)
+        header.addWidget(close_button)
+        panel_layout.addLayout(header)
+
+        self.body_layout = QVBoxLayout()
+        self.body_layout.setSpacing(12)
+        panel_layout.addLayout(self.body_layout)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(10)
+        self.title_edit = QLineEdit(self.note.get("title", ""))
+        self.author_edit = QLineEdit(self.note.get("author", ""))
+        self.date_edit = QDateEdit()
+        self.date_edit.setCalendarPopup(True)
+        self.date_edit.setDisplayFormat("dd/MM/yyyy")
+        current_date = QDate.currentDate()
+        note_date = QDate.fromString(str(self.note.get("date", "")), "yyyy-MM-dd")
+        self.date_edit.setDate(note_date if note_date.isValid() else current_date)
+        self.importance_edit = QLineEdit(self.note.get("importance", ""))
+        self.importance_edit.setPlaceholderText("Opcional")
+        grid.addWidget(QLabel("Título"), 0, 0)
+        grid.addWidget(self.title_edit, 0, 1)
+        grid.addWidget(QLabel("Autor"), 0, 2)
+        grid.addWidget(self.author_edit, 0, 3)
+        grid.addWidget(QLabel("Fecha"), 1, 0)
+        grid.addWidget(self.date_edit, 1, 1)
+        grid.addWidget(QLabel("Importancia"), 1, 2)
+        grid.addWidget(self.importance_edit, 1, 3)
+        self.body_layout.addLayout(grid)
+
+        self.editor = PressBlockEditor()
+        self.editor.set_blocks(list(self.note.get("blocks", []) or []))
+        self.body_layout.addWidget(self.editor, 1)
+
+        footer = QHBoxLayout()
+        footer.addStretch()
+        cancel_btn = QPushButton("Cancelar")
+        cancel_btn.clicked.connect(self.reject)
+        save_btn = QPushButton("Guardar")
+        save_btn.setObjectName("primaryButton")
+        save_btn.clicked.connect(self.accept)
+        footer.addWidget(cancel_btn)
+        footer.addWidget(save_btn)
+        self.body_layout.addLayout(footer)
+
+        fade_in(self.panel, 180)
+
+    def result_payload(self) -> dict:
+        return {
+            "id": self.note_id,
+            "title": self.title_edit.text().strip(),
+            "author": self.author_edit.text().strip(),
+            "date": self.date_edit.date().toString("yyyy-MM-dd"),
+            "importance": self.importance_edit.text().strip(),
+            "blocks": self.editor.blocks(),
+        }
+
+
+class PressNoteCard(QFrame):
+    def __init__(self, note: dict, on_open, on_edit, on_delete, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.note = note
+        self.on_open = on_open
+        self.on_edit = on_edit
+        self.on_delete = on_delete
+        self.setObjectName("pressCard")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(10)
+        self.title_label = QLabel(str(self.note.get("title", "")) or "Sin título")
+        self.title_label.setObjectName("transitionTitle")
+        self.title_label.setWordWrap(True)
+        top.addWidget(self.title_label, 1)
+
+        self.menu_button = QToolButton()
+        self.menu_button.setText("⋮")
+        self.menu_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.menu_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.menu_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.menu_button.setAutoRaise(True)
+        self.menu_button.setMenu(self._build_menu())
+        top.addWidget(self.menu_button, 0, alignment=Qt.AlignmentFlag.AlignTop)
+        layout.addLayout(top)
+
+        meta = QLabel(self._meta_text())
+        meta.setObjectName("muted")
+        meta.setWordWrap(True)
+        layout.addWidget(meta)
+
+        importance = str(self.note.get("importance", "")).strip()
+        if importance:
+            chip = QLabel(importance)
+            chip.setObjectName("stateChip")
+            layout.addWidget(chip, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        summary = QLabel(str(self.note.get("summary") or _press_summary_from_blocks(list(self.note.get("blocks", []) or []))))
+        summary.setWordWrap(True)
+        summary.setObjectName("muted")
+        layout.addWidget(summary)
+
+    def _meta_text(self) -> str:
+        author = str(self.note.get("author", "")).strip() or "Sin autor"
+        date = self.note.get("date", "")
+        try:
+            date_obj = QDate.fromString(str(date), "yyyy-MM-dd")
+            date_label = date_obj.toString("dd/MM/yyyy") if date_obj.isValid() else str(date)
+        except Exception:
+            date_label = str(date)
+        return f"{author} · {date_label}"
+
+    def _build_menu(self) -> QMenu:
+        menu = QMenu(self)
+        edit_action = QAction("Editar", self)
+        delete_action = QAction("Eliminar", self)
+        edit_action.triggered.connect(lambda: self.on_edit(self.note))
+        delete_action.triggered.connect(lambda: self.on_delete(self.note))
+        menu.addAction(edit_action)
+        menu.addAction(delete_action)
+        return menu
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.on_open(self.note)
+        super().mousePressEvent(event)
+
+
+class PressImageViewer(QFrame):
+    def __init__(self, path: str, caption: str = "", parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("pressBlock")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(8)
+        image = QLabel()
+        image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        image.setWordWrap(True)
+        pix = QPixmap(str(_resolve_press_path(path)))
+        if pix.isNull():
+            image.setText("No se pudo cargar la imagen.")
+        else:
+            image.setPixmap(pix.scaledToWidth(760, Qt.TransformationMode.SmoothTransformation))
+        layout.addWidget(image)
+        if caption:
+            cap = QLabel(caption)
+            cap.setObjectName("muted")
+            cap.setWordWrap(True)
+            layout.addWidget(cap)
+
+
+class PressCarouselViewer(QFrame):
+    def __init__(self, items: list[dict], title: str = "", parent: QWidget | None = None):
+        super().__init__(parent)
+        self.items = list(items)
+        self.index = 0
+        self.setObjectName("pressBlock")
+        self._build_ui(title)
+        self._show_current()
+
+    def _build_ui(self, title: str) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+        if title:
+            ttl = QLabel(title)
+            ttl.setObjectName("status")
+            layout.addWidget(ttl)
+        self.viewer = QLabel()
+        self.viewer.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.viewer.setMinimumHeight(220)
+        self.viewer.setWordWrap(True)
+        layout.addWidget(self.viewer)
+        nav = QHBoxLayout()
+        self.prev_btn = QPushButton("Anterior")
+        self.prev_btn.clicked.connect(self._previous)
+        self.next_btn = QPushButton("Siguiente")
+        self.next_btn.clicked.connect(self._next)
+        self.counter = QLabel("")
+        self.counter.setObjectName("muted")
+        nav.addWidget(self.prev_btn)
+        nav.addWidget(self.next_btn)
+        nav.addStretch()
+        nav.addWidget(self.counter)
+        layout.addLayout(nav)
+
+    def _show_current(self) -> None:
+        if not self.items:
+            self.counter.setText("0/0")
+            self.viewer.setText("Sin imágenes")
+            return
+        self.index %= len(self.items)
+        item = self.items[self.index]
+        path = str(item.get("path", ""))
+        label = str(item.get("label") or Path(path).stem or "Imagen")
+        self.counter.setText(f"{self.index + 1}/{len(self.items)} · {label}")
+        pix = QPixmap(str(_resolve_press_path(path)))
+        if pix.isNull():
+            self.viewer.setText("No se pudo cargar la imagen.")
+            return
+        self.viewer.setPixmap(pix.scaledToWidth(760, Qt.TransformationMode.SmoothTransformation))
+
+    def _previous(self) -> None:
+        if self.items:
+            self.index = (self.index - 1) % len(self.items)
+            self._show_current()
+
+    def _next(self) -> None:
+        if self.items:
+            self.index = (self.index + 1) % len(self.items)
+            self._show_current()
+
+
+class PressVideoViewer(QFrame):
+    def __init__(self, path: str, caption: str = "", parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("pressBlock")
+        self._player = None
+        self._audio = None
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(8)
+        if caption:
+            cap = QLabel(caption)
+            cap.setObjectName("status")
+            layout.addWidget(cap)
+        if _MULTIMEDIA_AVAILABLE:
+            self.video_view = QVideoWidget()
+            self.video_view.setMinimumHeight(280)
+            layout.addWidget(self.video_view)
+            self._player = QMediaPlayer(self)
+            self._audio = QAudioOutput(self)
+            self._player.setAudioOutput(self._audio)
+            self._player.setVideoOutput(self.video_view)
+            self._player.setSource(QUrl.fromLocalFile(str(_resolve_press_path(path).resolve())))
+            self._player.play()
+        else:
+            label = QLabel("El reproductor de vídeo no está disponible en este entorno.")
+            label.setWordWrap(True)
+            layout.addWidget(label)
+            open_btn = QPushButton("Abrir externamente")
+            open_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(_resolve_press_path(path).resolve()))))
+            layout.addWidget(open_btn, alignment=Qt.AlignmentFlag.AlignLeft)
+
+    def stop(self) -> None:
+        if self._player is not None:
+            self._player.stop()
+
+
+class PressDocumentViewer(QFrame):
+    def __init__(self, path: str, caption: str = "", parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("pressBlock")
+        self._pdf = None
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(8)
+        if caption:
+            cap = QLabel(caption)
+            cap.setObjectName("status")
+            layout.addWidget(cap)
+        resolved = _resolve_press_path(path)
+        mime_type, _ = mimetypes.guess_type(str(resolved))
+        if resolved.suffix.lower() == ".pdf" and _PDF_AVAILABLE:
+            self.viewer = QPdfView()
+            self.viewer.setMinimumHeight(320)
+            layout.addWidget(self.viewer)
+            self._pdf = QPdfDocument(self)
+            self._pdf.load(str(resolved))
+            self.viewer.setDocument(self._pdf)
+        elif resolved.suffix.lower() in {".txt", ".md", ".log", ".json", ".csv", ".rtf", ".py"} or (mime_type or "").startswith("text/"):
+            text_view = QTextEdit()
+            text_view.setReadOnly(True)
+            try:
+                text_view.setPlainText(resolved.read_text(encoding="utf-8"))
+            except Exception:
+                try:
+                    text_view.setPlainText(resolved.read_text(encoding="latin-1"))
+                except Exception:
+                    text_view.setPlainText("No se pudo leer el documento.")
+            text_view.setMinimumHeight(320)
+            layout.addWidget(text_view)
+        else:
+            label = QLabel("Vista integrada no disponible para este formato.")
+            label.setWordWrap(True)
+            layout.addWidget(label)
+            open_btn = QPushButton("Abrir externamente")
+            open_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(resolved.resolve()))))
+            layout.addWidget(open_btn, alignment=Qt.AlignmentFlag.AlignLeft)
+
+
+class PressIntroScreen(QWidget):
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._progress = 0.0
+        self._finish_callback = None
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._tick)
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(18)
+        layout.addStretch()
+        layout.addWidget(LogoLabel(QSize(460, 170)), alignment=Qt.AlignmentFlag.AlignCenter)
+        self.orbit = OrbitalLoader()
+        layout.addWidget(self.orbit, alignment=Qt.AlignmentFlag.AlignCenter)
+        title = QLabel("Notas de Prensa")
+        title.setObjectName("transitionTitle")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
+        subtitle = QLabel("Sincronizando archivo editorial")
+        subtitle.setObjectName("muted")
+        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(subtitle)
+        layout.addStretch()
+
+    def start(self, finished_callback) -> None:
+        self._finish_callback = finished_callback
+        self._progress = 0.0
+        self.timer.start(16)
+        QTimer.singleShot(1400, self._finish)
+
+    def _tick(self) -> None:
+        self._progress = min(1.0, self._progress + 0.02)
+        self.update()
+        if self._progress >= 1.0:
+            self.timer.stop()
+
+    def _finish(self) -> None:
+        self.timer.stop()
+        if self._finish_callback is not None:
+            self._finish_callback()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#07111d"))
+        center = self.rect().center()
+        painter.setPen(QPen(QColor(59, 89, 119, 160), 1))
+        for radius in (86, 132, 188):
+            painter.drawEllipse(center, radius, radius)
+        painter.setPen(QPen(QColor(111, 196, 233, 180), 2))
+        orbit_angle = self._progress * 360.0
+        for offset, radius in [(0, 188), (42, 132), (118, 86)]:
+            rect = QRect(center.x() - radius, center.y() - radius, radius * 2, radius * 2)
+            painter.drawArc(rect, int((orbit_angle + offset) * 16), 120 * 16)
+        points = [
+            (math.cos(math.radians(orbit_angle)) * 188, math.sin(math.radians(orbit_angle)) * 188),
+            (math.cos(math.radians(orbit_angle + 42)) * 132, math.sin(math.radians(orbit_angle + 42)) * 132),
+            (math.cos(math.radians(orbit_angle + 118)) * 86, math.sin(math.radians(orbit_angle + 118)) * 86),
+        ]
+        painter.setPen(QPen(QColor(92, 144, 178, 150), 1))
+        painter.drawLine(int(center.x() + points[0][0]), int(center.y() + points[0][1]), int(center.x() + points[1][0]), int(center.y() + points[1][1]))
+        painter.drawLine(int(center.x() + points[1][0]), int(center.y() + points[1][1]), int(center.x() + points[2][0]), int(center.y() + points[2][1]))
+        painter.setBrush(QColor("#97f2de"))
+        painter.setPen(Qt.PenStyle.NoPen)
+        for px, py in points:
+            painter.drawEllipse(int(center.x() + px) - 5, int(center.y() + py) - 5, 10, 10)
+
+
+class PressReaderScreen(QWidget):
+    back_clicked = pyqtSignal()
+
+    def __init__(self, store: PressStore, on_edit, on_delete, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.store = store
+        self.on_edit = on_edit
+        self.on_delete = on_delete
+        self.current_note_id: int | None = None
+        self._video_widgets: list[PressVideoViewer] = []
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(24, 24, 24, 24)
+        root.setSpacing(0)
+
+        self.panel = GlassPanel()
+        self.panel.setObjectName("pressPanel")
+        self.panel.setStyleSheet("""
+            QFrame#pressPanel {
+                background: #101d2c;
+                border: 1px solid rgba(126, 164, 196, 90);
+                border-radius: 14px;
+            }
+        """)
+        root.addWidget(self.panel)
+
+        panel_layout = QVBoxLayout(self.panel)
+        panel_layout.setContentsMargins(18, 16, 18, 18)
+        panel_layout.setSpacing(14)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(10)
+        back_btn = QPushButton("Volver")
+        back_btn.setObjectName("primaryButton")
+        back_btn.clicked.connect(self.back_clicked.emit)
+        header.addWidget(back_btn)
+        header.addStretch()
+
+        title_box = QVBoxLayout()
+        title_box.setContentsMargins(0, 0, 0, 0)
+        title_box.setSpacing(2)
+        title = QLabel("Notas de Prensa")
+        title.setObjectName("title")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        subtitle = QLabel("Vista de lectura editorial")
+        subtitle.setObjectName("muted")
+        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title_box.addWidget(title)
+        title_box.addWidget(subtitle)
+        header.addLayout(title_box, 1)
+        header.addStretch()
+
+        self.menu_button = QToolButton()
+        self.menu_button.setText("⋮")
+        self.menu_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.menu_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.menu_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.menu_button.setAutoRaise(True)
+        self.menu_button.setMenu(QMenu(self))
+        header.addWidget(self.menu_button)
+        panel_layout.addLayout(header)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll.setStyleSheet("background: transparent; border: none;")
+        self.content = QWidget()
+        self.content_layout = QVBoxLayout(self.content)
+        self.content_layout.setContentsMargins(0, 0, 0, 0)
+        self.content_layout.setSpacing(14)
+        self.scroll.setWidget(self.content)
+        panel_layout.addWidget(self.scroll, 1)
+
+    def show_note(self, note: dict) -> None:
+        self.current_note_id = int(note.get("id", 0) or 0)
+        self._rebuild_menu(note)
+        self._clear_content()
+        title = QLabel(str(note.get("title", "")) or "Sin título")
+        title.setObjectName("transitionTitle")
+        title.setWordWrap(True)
+        self.content_layout.addWidget(title)
+        meta = QLabel(self._meta_text(note))
+        meta.setObjectName("muted")
+        meta.setWordWrap(True)
+        self.content_layout.addWidget(meta)
+        importance = str(note.get("importance", "")).strip()
+        if importance:
+            chip = QLabel(importance)
+            chip.setObjectName("stateChip")
+            self.content_layout.addWidget(chip, alignment=Qt.AlignmentFlag.AlignLeft)
+        for block in list(note.get("blocks", []) or []):
+            block_type = str(block.get("type", "")).strip().lower()
+            if block_type == "text":
+                label = QLabel(str(block.get("html") or block.get("plain") or ""))
+                label.setWordWrap(True)
+                label.setTextFormat(Qt.TextFormat.RichText)
+                label.setOpenExternalLinks(True)
+                self.content_layout.addWidget(label)
+            elif block_type == "image":
+                self.content_layout.addWidget(PressImageViewer(str(block.get("path", "")), str(block.get("label", ""))))
+            elif block_type == "carousel":
+                self.content_layout.addWidget(PressCarouselViewer(list(block.get("items", []) or []), str(block.get("label", ""))))
+            elif block_type == "video":
+                viewer = PressVideoViewer(str(block.get("path", "")), str(block.get("label", "")))
+                self._video_widgets.append(viewer)
+                self.content_layout.addWidget(viewer)
+            elif block_type == "document":
+                self.content_layout.addWidget(PressDocumentViewer(str(block.get("path", "")), str(block.get("label", ""))))
+        self.content_layout.addStretch()
+        self.scroll.verticalScrollBar().setValue(0)
+
+    def _meta_text(self, note: dict) -> str:
+        author = str(note.get("author", "")).strip() or "Sin autor"
+        date = str(note.get("date", "")).strip()
+        date_obj = QDate.fromString(date, "yyyy-MM-dd")
+        date_label = date_obj.toString("dd/MM/yyyy") if date_obj.isValid() else date
+        return f"{author} · {date_label}"
+
+    def _clear_content(self) -> None:
+        while self.content_layout.count():
+            item = self.content_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                if isinstance(widget, PressVideoViewer):
+                    widget.stop()
+                widget.setParent(None)
+        self._video_widgets.clear()
+
+    def _rebuild_menu(self, note: dict) -> None:
+        menu = QMenu(self)
+        edit_action = QAction("Editar", self)
+        delete_action = QAction("Eliminar", self)
+        edit_action.triggered.connect(lambda: self.on_edit(note))
+        delete_action.triggered.connect(lambda: self.on_delete(note))
+        menu.addAction(edit_action)
+        menu.addAction(delete_action)
+        self.menu_button.setMenu(menu)
+
+
+class PressListScreen(QWidget):
+    back_clicked = pyqtSignal()
+
+    def __init__(self, store: PressStore, on_open_note, on_create_note, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.store = store
+        self.on_open_note = on_open_note
+        self.on_create_note = on_create_note
+        self.current_query = ""
+        self.current_page = 1
+        self.page_size = 10
+        self._build_ui()
+        self.refresh()
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(24, 24, 24, 24)
+        root.setSpacing(0)
+
+        self.panel = GlassPanel()
+        self.panel.setObjectName("pressPanel")
+        self.panel.setStyleSheet("""
+            QFrame#pressPanel {
+                background: #101d2c;
+                border: 1px solid rgba(126, 164, 196, 90);
+                border-radius: 14px;
+            }
+        """)
+        root.addWidget(self.panel)
+
+        panel_layout = QVBoxLayout(self.panel)
+        panel_layout.setContentsMargins(18, 16, 18, 18)
+        panel_layout.setSpacing(14)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(10)
+        back_btn = QPushButton("Volver")
+        back_btn.setObjectName("primaryButton")
+        back_btn.clicked.connect(self.back_clicked.emit)
+        header.addWidget(back_btn)
+        header.addStretch()
+
+        title_box = QVBoxLayout()
+        title_box.setContentsMargins(0, 0, 0, 0)
+        title_box.setSpacing(2)
+        title = QLabel("Notas de Prensa")
+        title.setObjectName("title")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        subtitle = QLabel("Buscador, listado y gestión editorial")
+        subtitle.setObjectName("muted")
+        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title_box.addWidget(title)
+        title_box.addWidget(subtitle)
+        header.addLayout(title_box, 1)
+        header.addStretch()
+
+        panel_layout.addLayout(header)
+
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Buscar por título, fecha o importancia")
+        self.search.setMaximumWidth(560)
+        self.search.textChanged.connect(self._on_search_changed)
+        search_row = QHBoxLayout()
+        search_row.addStretch()
+        search_row.addWidget(self.search)
+        search_row.addStretch()
+        panel_layout.addLayout(search_row)
+
+        self.count_label = QLabel("")
+        self.count_label.setObjectName("muted")
+        self.count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        panel_layout.addWidget(self.count_label)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll.setStyleSheet("background: transparent; border: none;")
+        self.scroll_content = QWidget()
+        self.cards_layout = QVBoxLayout(self.scroll_content)
+        self.cards_layout.setContentsMargins(0, 0, 0, 0)
+        self.cards_layout.setSpacing(12)
+        self.scroll.setWidget(self.scroll_content)
+        panel_layout.addWidget(self.scroll, 1)
+
+        self.empty_label = QLabel("No se han encontrado coincidencias.")
+        self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_label.setObjectName("muted")
+        self.cards_layout.addWidget(self.empty_label)
+
+        pagination = QHBoxLayout()
+        self.prev_btn = QPushButton("Anterior")
+        self.next_btn = QPushButton("Siguiente")
+        self.prev_btn.setObjectName("primaryButton")
+        self.next_btn.setObjectName("primaryButton")
+        self.prev_btn.clicked.connect(self._previous_page)
+        self.next_btn.clicked.connect(self._next_page)
+        self.pages_container = QHBoxLayout()
+        pagination.addWidget(self.prev_btn)
+        pagination.addLayout(self.pages_container, 1)
+        pagination.addWidget(self.next_btn)
+        panel_layout.addLayout(pagination)
+
+        self.fab = QPushButton("+")
+        self.fab.setObjectName("pressFab")
+        self.fab.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.fab.setFixedSize(58, 58)
+        self.fab.clicked.connect(self.on_create_note)
+        self.fab.setParent(self)
+        self.fab.raise_()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        margin = 28
+        self.fab.move(self.width() - self.fab.width() - margin, self.height() - self.fab.height() - margin)
+
+    def refresh(self) -> None:
+        notes = self.store.query_notes(self.current_query)
+        total = len(notes)
+        total_pages = max(1, math.ceil(total / self.page_size))
+        self.current_page = min(max(1, self.current_page), total_pages)
+        start = (self.current_page - 1) * self.page_size
+        page_notes = notes[start:start + self.page_size]
+        self._rebuild_cards(page_notes)
+        self._rebuild_pagination(total_pages)
+        self.count_label.setText(f"{total} notas · Página {self.current_page}/{total_pages}")
+        self.empty_label.setVisible(total == 0)
+        self.prev_btn.setEnabled(self.current_page > 1)
+        self.next_btn.setEnabled(self.current_page < total_pages)
+
+    def _clear_layout(self, layout: QVBoxLayout | QHBoxLayout) -> None:
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            child_layout = item.layout()
+            if widget is not None:
+                widget.setParent(None)
+            elif child_layout is not None:
+                self._clear_layout(child_layout)
+
+    def _rebuild_cards(self, notes: list[dict]) -> None:
+        self._clear_layout(self.cards_layout)
+        if not notes:
+            self.cards_layout.addWidget(self.empty_label)
+            return
+        for note in notes:
+            card = PressNoteCard(note, self.on_open_note, self._edit_note, self._delete_note)
+            self.cards_layout.addWidget(card)
+        self.cards_layout.addStretch()
+
+    def _rebuild_pagination(self, total_pages: int) -> None:
+        self._clear_layout(self.pages_container)
+        max_buttons = 7
+        if total_pages <= max_buttons:
+            pages = range(1, total_pages + 1)
+        else:
+            start = max(1, self.current_page - 2)
+            end = min(total_pages, start + 4)
+            start = max(1, end - 4)
+            pages = range(start, end + 1)
+        for page in pages:
+            btn = QPushButton(str(page))
+            btn.setCheckable(True)
+            btn.setChecked(page == self.current_page)
+            btn.clicked.connect(lambda _=False, p=page: self._go_to_page(p))
+            self.pages_container.addWidget(btn)
+        self.pages_container.addStretch()
+
+    def _go_to_page(self, page: int) -> None:
+        self.current_page = page
+        self.refresh()
+
+    def _previous_page(self) -> None:
+        if self.current_page > 1:
+            self.current_page -= 1
+            self.refresh()
+
+    def _next_page(self) -> None:
+        total = len(self.store.query_notes(self.current_query))
+        total_pages = max(1, math.ceil(total / self.page_size))
+        if self.current_page < total_pages:
+            self.current_page += 1
+            self.refresh()
+
+    def _on_search_changed(self, text: str) -> None:
+        self.current_query = text
+        self.current_page = 1
+        self.refresh()
+
+    def _edit_note(self, note: dict) -> None:
+        self.on_open_note(note, edit_mode=True)
+
+    def _delete_note(self, note: dict) -> None:
+        self.on_open_note(note, delete_mode=True)
+
+
+class PressModuleScreen(QWidget):
+    def __init__(self, on_back_to_command_center, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.on_back_to_command_center = on_back_to_command_center
+        self.store = PressStore()
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.stack = QStackedWidget()
+        layout.addWidget(self.stack)
+
+        self.intro = PressIntroScreen()
+        self.list_screen = PressListScreen(self.store, self._open_note, self._create_note)
+        self.list_screen.back_clicked.connect(self.on_back_to_command_center)
+        self.reader = PressReaderScreen(self.store, self._edit_note, self._delete_note)
+        self.reader.back_clicked.connect(self._show_list)
+
+        self.stack.addWidget(self.intro)
+        self.stack.addWidget(self.list_screen)
+        self.stack.addWidget(self.reader)
+        self.stack.setCurrentWidget(self.list_screen)
+
+    def start(self) -> None:
+        self.stack.setCurrentWidget(self.intro)
+        self.intro.start(self._show_list)
+
+    def refresh(self) -> None:
+        self.list_screen.refresh()
+        if self.reader.current_note_id is not None:
+            note = self.store.get_note(self.reader.current_note_id)
+            if note is not None:
+                self.reader.show_note(note)
+
+    def _show_list(self) -> None:
+        self.stack.setCurrentWidget(self.list_screen)
+        self.list_screen.refresh()
+        fade_in(self.list_screen, 260)
+
+    def _open_note(self, note: dict, edit_mode: bool = False, delete_mode: bool = False) -> None:
+        note_id = int(note.get("id", 0) or 0)
+        current = self.store.get_note(note_id)
+        if current is None:
+            self._show_list()
+            return
+        if delete_mode:
+            self._delete_note(current)
+            return
+        if edit_mode:
+            self._edit_note(current)
+            return
+        self.reader.show_note(current)
+        self.stack.setCurrentWidget(self.reader)
+        fade_in(self.reader, 260)
+
+    def _create_note(self) -> None:
+        dialog = PressEditorDialog(self.store, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        payload = dialog.result_payload()
+        if not payload["title"]:
+            QMessageBox.warning(self, APP_NAME, "El título es obligatorio.")
+            return
+        self.store.upsert_note(payload)
+        self.refresh()
+        self._show_list()
+
+    def _edit_note(self, note: dict) -> None:
+        dialog = PressEditorDialog(self.store, note, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        payload = dialog.result_payload()
+        payload["id"] = note.get("id", 0)
+        if not payload["title"]:
+            QMessageBox.warning(self, APP_NAME, "El título es obligatorio.")
+            return
+        self.store.upsert_note(payload)
+        self.refresh()
+        updated = self.store.get_note(int(note.get("id", 0) or 0))
+        if updated is not None:
+            self.reader.show_note(updated)
+            self.stack.setCurrentWidget(self.reader)
+        else:
+            self._show_list()
+
+    def _delete_note(self, note: dict) -> None:
+        answer = QMessageBox.question(
+            self,
+            APP_NAME,
+            "¿Eliminar esta nota de prensa?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.store.delete_note(int(note.get("id", 0) or 0))
+        self.refresh()
+        self._show_list()
 
 
 def _format_ksp_ut(seconds: float | None) -> str:
@@ -4490,6 +6197,9 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.satellite_list)
         self.satellite_list.back_clicked.connect(self.show_command_center)
 
+        self.press_module = PressModuleScreen(self.show_command_center)
+        self.stack.addWidget(self.press_module)
+
     # ── Callbacks de conexión KSP ──────────────────────────────────────────────
 
     def _on_ksp_connected(self, conn) -> None:
@@ -4525,7 +6235,7 @@ class MainWindow(QMainWindow):
             return
 
         # El módulo "Mapa orbital" se abre dentro del mismo proceso y ventana
-        if module_name in {"Mapa orbital", "Lista de satélites"}:
+        if module_name in {"Mapa orbital", "Lista de satélites", "Notas de prensa"}:
             fade_out(self.command, lambda: self._show_transition(module_name, target))
             return
 
@@ -4547,6 +6257,9 @@ class MainWindow(QMainWindow):
             return
         if module_name == "Lista de satélites":
             self._launch_satellite_list()
+            return
+        if module_name == "Notas de prensa":
+            self._launch_press_notes()
             return
 
         # Módulos externos (comportamiento original)
@@ -4607,6 +6320,16 @@ class MainWindow(QMainWindow):
 
     def _open_orbital_map_from_list(self, vessel_name: str) -> None:
         self._launch_orbital_map(vessel_name)
+
+    def _launch_press_notes(self) -> None:
+        if self.press_module is None:
+            QMessageBox.critical(self, APP_NAME, "El módulo de notas de prensa no está disponible.")
+            self.show_command_center()
+            return
+        self.stack.setCurrentWidget(self.press_module)
+        self.press_module.start()
+        fade_in(self.press_module, 650)
+        self.statusBar().showMessage("Notas de prensa iniciadas", 5000)
 
     def closeEvent(self, event) -> None:
         """Asegura detener hilos y conexiones al cerrar la aplicación principal."""
@@ -4767,6 +6490,32 @@ def build_stylesheet() -> str:
     QFrame#saveContextCard[state="empty"] {
         border-color: rgba(255, 179, 179, 120);
         background: rgba(32, 18, 22, 224);
+    }
+    QFrame#pressCard {
+        background: rgba(14, 24, 36, 230);
+        border: 1px solid rgba(126, 164, 196, 84);
+        border-radius: 14px;
+    }
+    QFrame#pressCard:hover {
+        background: rgba(18, 31, 47, 245);
+        border-color: rgba(111, 196, 233, 140);
+    }
+    QFrame#pressBlock {
+        background: rgba(12, 22, 34, 225);
+        border: 1px solid rgba(126, 164, 196, 80);
+        border-radius: 14px;
+    }
+    QPushButton#pressFab {
+        background: #1d6f91;
+        color: #f3fbff;
+        border: 1px solid #66c7e8;
+        border-radius: 29px;
+        font-size: 26px;
+        font-weight: 700;
+    }
+    QPushButton#pressFab:hover {
+        background: #2585aa;
+        border-color: #9ee4f5;
     }
     QMessageBox {
         background: #101d2c;
