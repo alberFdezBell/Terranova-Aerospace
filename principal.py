@@ -8,6 +8,7 @@ internal/external module launching.
 from __future__ import annotations
 
 import base64
+import html
 import hashlib
 import hmac
 import json
@@ -29,7 +30,7 @@ from PySide6.QtCore import QVariantAnimation
 
 from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, QRect, QSize, Qt, QTimer, QThread, pyqtSignal, pyqtProperty, QDate
 from PyQt6.QtCore import QUrl
-from PyQt6.QtGui import QAction, QColor, QDesktopServices, QIcon, QPainter, QPen, QPixmap, QPalette, QFont, QCursor, QVector3D, QFontMetrics, QBrush
+from PyQt6.QtGui import QAction, QColor, QDesktopServices, QIcon, QPainter, QPen, QPixmap, QPalette, QFont, QCursor, QVector3D, QFontMetrics, QBrush, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -57,6 +58,7 @@ from PyQt6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
+    QTextBrowser,
     QStackedWidget,
     QMenu,
     QToolButton,
@@ -711,7 +713,7 @@ class ModuleCard(QWidget):
 
     def _subtitle_text(self) -> str:
         if self.available:
-            return "Módulo disponible para abrir."
+            return " "
         return "Módulo no disponible actualmente."
 
     def _load_pixmap(self) -> QPixmap:
@@ -917,7 +919,10 @@ def _press_date_sort_key(value: str) -> tuple[int, int, int, int]:
 
 
 def _press_plain_text_from_html(html: str) -> str:
-    text = re.sub(r"<br\s*/?>", "\n", html, flags=re.IGNORECASE)
+    text = re.sub(r"<style\b[^>]*>.*?</style>", " ", html, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<script\b[^>]*>.*?</script>", " ", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<head\b[^>]*>.*?</head>", " ", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
     text = re.sub(r"</p\s*>", "\n\n", text, flags=re.IGNORECASE)
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"&nbsp;", " ", text, flags=re.IGNORECASE)
@@ -982,6 +987,36 @@ def _press_media_kind_for_path(path: Path) -> str:
     if suffix in {".mp4", ".mov", ".mkv", ".webm", ".avi"}:
         return "video"
     return "document"
+
+
+def _press_encode_attachment_ref(path: str) -> str:
+    token = base64.urlsafe_b64encode(str(path).encode("utf-8")).decode("ascii").rstrip("=")
+    return f"attachment:{token}"
+
+
+def _press_decode_attachment_ref(href: str) -> str | None:
+    if not href.startswith("attachment:"):
+        return None
+    token = href.split(":", 1)[1].strip()
+    if not token:
+        return None
+    padding = "=" * (-len(token) % 4)
+    try:
+        return base64.urlsafe_b64decode(token + padding).decode("utf-8")
+    except Exception:
+        return None
+
+
+def _press_rewrite_attachment_refs(body_html: str, path_map: dict[str, str]) -> str:
+    if not body_html or not path_map:
+        return body_html
+    rewritten = body_html
+    for old_path, new_path in path_map.items():
+        old_href = _press_encode_attachment_ref(old_path)
+        new_href = _press_encode_attachment_ref(new_path)
+        rewritten = rewritten.replace(f'href="{old_href}"', f'href="{new_href}"')
+        rewritten = rewritten.replace(f"href='{old_href}'", f"href='{new_href}'")
+    return rewritten
 
 
 def _press_relativize_path(path: Path) -> str:
@@ -1091,11 +1126,21 @@ class PressStore:
             max_id = max(max_id, note_id)
             legacy_blocks = list(note.get("blocks", []) or [])
             body_html = str(note.get("body_html", "")).strip()
+            main_image = str(note.get("main_image", "")).strip()
             attachments = list(note.get("attachments", []) or [])
             if legacy_blocks and not body_html and not attachments:
                 body_html, attachments = _press_legacy_body_and_attachments(legacy_blocks)
             body_html = self._normalize_body_html(body_html)
-            attachments = self._normalize_attachments(note_id, attachments, import_media=import_media)
+            attachments, path_map = self._normalize_attachments(note_id, attachments, import_media=import_media)
+            main_image = self._normalize_media_path(note_id, main_image, "image", import_media=import_media)
+            body_html = _press_rewrite_attachment_refs(body_html, path_map)
+            # El resumen se recalcula siempre a partir del contenido actual de la nota
+            # para evitar que quede un resumen obsoleto o con restos de marcado/CSS
+            # si la nota se editó después de haberse guardado por primera vez.
+            summary = _press_summary_from_text(body_html)
+            if not summary:
+                summary = _press_plain_text_from_html(str(note.get("summary") or "").strip())
+            summary = _shorten_text(summary.replace("\n", " "), 140) if summary else "Sin resumen disponible."
             normalized.append({
                 "id": note_id,
                 "title": str(note.get("title", "")).strip(),
@@ -1103,8 +1148,9 @@ class PressStore:
                 "date": self._normalize_date(str(note.get("date", "")).strip()),
                 "importance": str(note.get("importance", "")).strip(),
                 "body_html": body_html,
+                "main_image": main_image,
                 "attachments": attachments,
-                "summary": str(note.get("summary") or _press_summary_from_text(body_html)),
+                "summary": summary,
                 "created_at": float(note.get("created_at") or time.time()),
                 "updated_at": float(note.get("updated_at") or note.get("created_at") or time.time()),
             })
@@ -1153,8 +1199,9 @@ class PressStore:
         shutil.copy2(source, destination)
         return _press_relativize_path(destination)
 
-    def _normalize_attachments(self, note_id: int, attachments: list[dict], import_media: bool) -> list[dict]:
+    def _normalize_attachments(self, note_id: int, attachments: list[dict], import_media: bool) -> tuple[list[dict], dict[str, str]]:
         normalized: list[dict] = []
+        path_map: dict[str, str] = {}
         for entry in attachments:
             raw_path = str(entry.get("path", "")).strip()
             if not raw_path:
@@ -1163,16 +1210,29 @@ class PressStore:
             attachment_type = str(entry.get("type") or _press_media_kind_for_path(resolved)).strip().lower()
             if attachment_type not in {"image", "video", "document"}:
                 attachment_type = _press_media_kind_for_path(resolved)
+            normalized_path = raw_path
             if resolved.exists() and import_media:
-                raw_path = self._import_media_file(note_id, str(resolved), attachment_type)
+                normalized_path = self._import_media_file(note_id, str(resolved), attachment_type)
             elif resolved.is_absolute():
-                raw_path = _press_relativize_path(resolved)
+                normalized_path = _press_relativize_path(resolved)
             normalized.append({
-                "path": raw_path,
+                "path": normalized_path,
                 "label": str(entry.get("label") or resolved.stem or "Archivo").strip(),
                 "type": attachment_type,
             })
-        return normalized
+            path_map[raw_path] = normalized_path
+        return normalized, path_map
+
+    def _normalize_media_path(self, note_id: int, raw_path: str, media_type: str, import_media: bool) -> str:
+        raw_path = str(raw_path or "").strip()
+        if not raw_path:
+            return ""
+        resolved = _resolve_press_path(raw_path)
+        if resolved.exists() and import_media:
+            return self._import_media_file(note_id, str(resolved), media_type)
+        if resolved.is_absolute():
+            return _press_relativize_path(resolved)
+        return raw_path
 
     def _iter_media_paths(self) -> set[Path]:
         paths: set[Path] = set()
@@ -1218,10 +1278,19 @@ def _resolve_press_path(value: str) -> Path:
 
 class PressTextEdit(QTextEdit):
     activated = pyqtSignal(object)
+    reference_requested = pyqtSignal()
 
     def focusInEvent(self, event) -> None:
         self.activated.emit(self)
         super().focusInEvent(event)
+
+    def keyPressEvent(self, event) -> None:
+        super().keyPressEvent(event)
+        try:
+            if event.text() == "@":
+                self.reference_requested.emit()
+        except Exception:
+            pass
 
 
 class PressTextBlockWidget(QFrame):
@@ -1765,6 +1834,7 @@ class PressEditorDialog(QWidget):
             | Qt.WindowType.WindowMinMaxButtonsHint
             | Qt.WindowType.WindowCloseButtonHint
         )
+        self.setWindowModality(Qt.WindowModality.ApplicationModal)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.resize(920, 780)
         self.setStyleSheet("QWidget { background: #07111d; }")
@@ -1829,10 +1899,40 @@ class PressEditorDialog(QWidget):
         grid.addWidget(self.importance_edit, 1, 3)
         panel_layout.addLayout(grid)
 
-        self.editor = QTextEdit()
+        self.main_image_path = str(self.note.get("main_image", "")).strip()
+        image_section = QHBoxLayout()
+        image_section.setSpacing(12)
+        image_box = QVBoxLayout()
+        image_box.setSpacing(8)
+        image_label = QLabel("Imagen principal")
+        image_label.setObjectName("status")
+        image_box.addWidget(image_label)
+        self.main_image_preview = QLabel()
+        self.main_image_preview.setMinimumHeight(150)
+        self.main_image_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.main_image_preview.setWordWrap(True)
+        self.main_image_preview.setStyleSheet(
+            "QLabel { background: rgba(7, 16, 25, 180); border: 1px solid rgba(126, 164, 196, 80); border-radius: 10px; color: #91a8bb; padding: 10px; }"
+        )
+        image_box.addWidget(self.main_image_preview, 1)
+        image_btns = QHBoxLayout()
+        select_image_btn = QPushButton("Seleccionar imagen")
+        select_image_btn.clicked.connect(self._choose_main_image)
+        clear_image_btn = QPushButton("Quitar imagen")
+        clear_image_btn.clicked.connect(self._clear_main_image)
+        image_btns.addWidget(select_image_btn)
+        image_btns.addWidget(clear_image_btn)
+        image_btns.addStretch()
+        image_box.addLayout(image_btns)
+        image_section.addLayout(image_box, 1)
+        panel_layout.addLayout(image_section)
+        self._refresh_main_image_preview()
+
+        self.editor = PressTextEdit()
         self.editor.setPlaceholderText("Escribe aquí la nota de prensa...")
         self.editor.setAcceptRichText(True)
         self.editor.setMinimumHeight(300)
+        self.editor.reference_requested.connect(lambda: self._show_reference_menu(True))
         legacy_body = str(self.note.get("body_html", "")).strip()
         if not legacy_body and self.note.get("blocks"):
             legacy_body, _ = _press_legacy_body_and_attachments(list(self.note.get("blocks", []) or []))
@@ -1856,8 +1956,11 @@ class PressEditorDialog(QWidget):
         add_attachment_btn.clicked.connect(self._add_attachment)
         remove_attachment_btn = QPushButton("Eliminar archivo")
         remove_attachment_btn.clicked.connect(self._remove_attachment)
+        reference_btn = QPushButton("@ Referencia")
+        reference_btn.clicked.connect(lambda: self._show_reference_menu(False))
         attachment_buttons.addWidget(add_attachment_btn)
         attachment_buttons.addWidget(remove_attachment_btn)
+        attachment_buttons.addWidget(reference_btn)
         attachment_buttons.addStretch()
         panel_layout.addLayout(attachment_buttons)
 
@@ -1885,6 +1988,97 @@ class PressEditorDialog(QWidget):
             item = QListWidgetItem(f"{label} · {kind.upper()}")
             item.setData(Qt.ItemDataRole.UserRole, {"path": path, "label": label, "type": kind})
             self.attachments.addItem(item)
+
+    def _attachment_payloads(self) -> list[dict]:
+        payloads: list[dict] = []
+        for index in range(self.attachments.count()):
+            item = self.attachments.item(index)
+            payload = item.data(Qt.ItemDataRole.UserRole) or {}
+            path = str(payload.get("path", "")).strip()
+            if not path:
+                continue
+            payloads.append({
+                "path": path,
+                "label": str(payload.get("label") or Path(path).stem or "Archivo").strip(),
+                "type": str(payload.get("type") or _press_media_kind_for_path(_resolve_press_path(path))).strip().lower(),
+            })
+        return payloads
+
+    def _refresh_main_image_preview(self) -> None:
+        path = str(self.main_image_path).strip()
+        if not path:
+            self.main_image_preview.setPixmap(QPixmap())
+            self.main_image_preview.setText("Sin imagen principal")
+            return
+        resolved = _resolve_press_path(path)
+        if not resolved.exists():
+            self.main_image_preview.setPixmap(QPixmap())
+            self.main_image_preview.setText("La imagen principal no se encontró.")
+            return
+        pix = QPixmap(str(resolved))
+        if pix.isNull():
+            self.main_image_preview.setPixmap(QPixmap())
+            self.main_image_preview.setText("No se pudo cargar la imagen principal.")
+            return
+        self.main_image_preview.setText("")
+        self.main_image_preview.setPixmap(
+            pix.scaled(
+                self.main_image_preview.size().expandedTo(QSize(640, 240)),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+
+    def _choose_main_image(self) -> None:
+        file_name, _ = QFileDialog.getOpenFileName(
+            self,
+            "Seleccionar imagen principal",
+            str(BASE_DIR),
+            "Imágenes (*.png *.jpg *.jpeg *.bmp *.gif *.webp);;Todos los archivos (*)",
+        )
+        if not file_name:
+            return
+        self.main_image_path = str(Path(file_name))
+        self._refresh_main_image_preview()
+
+    def _clear_main_image(self) -> None:
+        self.main_image_path = ""
+        self._refresh_main_image_preview()
+
+    def _insert_attachment_reference(self, attachment: dict, replace_at: bool = False) -> None:
+        path = str(attachment.get("path", "")).strip()
+        label = str(attachment.get("label") or Path(path).stem or "Adjunto").strip()
+        if not path:
+            return
+        cursor = self.editor.textCursor()
+        cursor.beginEditBlock()
+        try:
+            if replace_at:
+                cursor.movePosition(QTextCursor.MoveOperation.Left, QTextCursor.MoveMode.KeepAnchor, 1)
+                if cursor.selectedText() == "@":
+                    cursor.removeSelectedText()
+                else:
+                    cursor.clearSelection()
+            href = _press_encode_attachment_ref(path)
+            link_html = f'<a href="{href}">@{html.escape(label)}</a>'
+            cursor.insertHtml(link_html)
+            cursor.insertText(" ")
+        finally:
+            cursor.endEditBlock()
+
+    def _show_reference_menu(self, replace_at: bool = False) -> None:
+        attachments = self._attachment_payloads()
+        if not attachments:
+            QMessageBox.information(self, APP_NAME, "Añade al menos un adjunto para poder referenciarlo.")
+            return
+        menu = QMenu(self)
+        menu.setObjectName("pressNoteMenu")
+        for attachment in attachments:
+            action = QAction(f"@{attachment['label']}", self)
+            action.triggered.connect(lambda _=False, payload=dict(attachment), replace_at=replace_at: self._insert_attachment_reference(payload, replace_at=replace_at))
+            menu.addAction(action)
+        pos = self.editor.viewport().mapToGlobal(self.editor.cursorRect().bottomLeft())
+        menu.exec(pos)
 
     def _add_attachment(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(
@@ -1933,12 +2127,18 @@ class PressEditorDialog(QWidget):
             "date": self.date_edit.date().toString("yyyy-MM-dd"),
             "importance": self.importance_edit.text().strip(),
             "body_html": self.editor.toHtml().strip(),
+            "main_image": self.main_image_path.strip(),
             "attachments": attachments,
         }
 
     def closeEvent(self, event) -> None:
         self.closed.emit()
         super().closeEvent(event)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if hasattr(self, "main_image_preview"):
+            self._refresh_main_image_preview()
 
 
 class PressNoteCard(QFrame):
@@ -1950,12 +2150,16 @@ class PressNoteCard(QFrame):
         self.on_delete = on_delete
         self.setObjectName("pressCard")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self.setMouseTracking(True)
+        self._hovered = False
         self._build_ui()
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 14, 16, 14)
-        layout.setSpacing(10)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(9)
 
         top = QHBoxLayout()
         top.setContentsMargins(0, 0, 0, 0)
@@ -1963,32 +2167,29 @@ class PressNoteCard(QFrame):
         self.title_label = QLabel(str(self.note.get("title", "")) or "Sin título")
         self.title_label.setObjectName("transitionTitle")
         self.title_label.setWordWrap(True)
+        self.title_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         top.addWidget(self.title_label, 1)
-
-        self.menu_button = QToolButton()
-        self.menu_button.setText("⋮")
-        self.menu_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.menu_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        self.menu_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
-        self.menu_button.setAutoRaise(True)
-        self.menu_button.setMenu(self._build_menu())
-        top.addWidget(self.menu_button, 0, alignment=Qt.AlignmentFlag.AlignTop)
         layout.addLayout(top)
 
         meta = QLabel(self._meta_text())
         meta.setObjectName("muted")
         meta.setWordWrap(True)
+        meta.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         layout.addWidget(meta)
 
         importance = str(self.note.get("importance", "")).strip()
         if importance:
             chip = QLabel(importance)
             chip.setObjectName("stateChip")
+            chip.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
             layout.addWidget(chip, alignment=Qt.AlignmentFlag.AlignLeft)
 
-        summary = QLabel(str(self.note.get("summary") or _press_summary_from_text(str(self.note.get("body_html", "")))))
+        summary = QLabel(self._summary_text())
         summary.setWordWrap(True)
         summary.setObjectName("muted")
+        summary.setTextFormat(Qt.TextFormat.PlainText)
+        summary.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        summary.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         layout.addWidget(summary)
 
     def _meta_text(self) -> str:
@@ -2001,20 +2202,47 @@ class PressNoteCard(QFrame):
             date_label = str(date)
         return f"{author} · {date_label}"
 
-    def _build_menu(self) -> QMenu:
-        menu = QMenu(self)
-        edit_action = QAction("Editar", self)
-        delete_action = QAction("Eliminar", self)
-        edit_action.triggered.connect(lambda: self.on_edit(self.note))
-        delete_action.triggered.connect(lambda: self.on_delete(self.note))
-        menu.addAction(edit_action)
-        menu.addAction(delete_action)
-        return menu
+    def _set_hovered(self, active: bool) -> None:
+        if self._hovered == active:
+            return
+        self._hovered = active
+        self.setProperty("hovered", active)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+
+    def enterEvent(self, event) -> None:
+        super().enterEvent(event)
+        self._set_hovered(True)
+
+    def leaveEvent(self, event) -> None:
+        super().leaveEvent(event)
+        self._set_hovered(False)
+
+    def _summary_text(self) -> str:
+        blocks = list(self.note.get("blocks", []) or [])
+        if blocks:
+            return _press_summary_from_blocks(blocks)
+        body_html = str(self.note.get("body_html", "")).strip()
+        summary = str(self.note.get("summary", "")).strip()
+        if summary:
+            return _press_plain_text_from_html(summary)
+        if body_html:
+            return _press_summary_from_text(body_html)
+        return "Sin resumen disponible."
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             self.on_open(self.note)
         super().mousePressEvent(event)
+
+    def enterEvent(self, event) -> None:
+        super().enterEvent(event)
+        self._set_hovered(True)
+
+    def leaveEvent(self, event) -> None:
+        super().leaveEvent(event)
+        self._set_hovered(False)
 
 
 class PressImageViewer(QFrame):
@@ -2180,6 +2408,70 @@ class PressDocumentViewer(QFrame):
             layout.addWidget(open_btn, alignment=Qt.AlignmentFlag.AlignLeft)
 
 
+class PressAttachmentWindow(QMainWindow):
+    def __init__(self, attachment: dict, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.attachment = dict(attachment)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self.setWindowTitle(str(self.attachment.get("label") or "Adjunto"))
+        self.setWindowIcon(QIcon(str(LOGO_PATH_CORT if LOGO_PATH_CORT.exists() else LOGO_PATH)))
+        self.setMinimumSize(900, 620)
+        self.resize(1100, 760)
+
+        central = QWidget()
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(14)
+
+        title = QLabel(str(self.attachment.get("label") or "Adjunto"))
+        title.setObjectName("transitionTitle")
+        title.setWordWrap(True)
+        layout.addWidget(title)
+
+        meta = QLabel(self._meta_text())
+        meta.setObjectName("muted")
+        meta.setWordWrap(True)
+        layout.addWidget(meta)
+
+        self.viewer: QWidget | None = None
+        self._build_viewer(layout)
+        self.setCentralWidget(central)
+
+    def _meta_text(self) -> str:
+        path = str(self.attachment.get("path", "")).strip()
+        att_type = str(self.attachment.get("type", "")).strip().lower()
+        return f"{att_type or 'archivo'} · {Path(path).name or 'sin nombre'}"
+
+    def _build_viewer(self, layout: QVBoxLayout) -> None:
+        path = str(self.attachment.get("path", "")).strip()
+        att_type = str(self.attachment.get("type", "")).strip().lower()
+        label = str(self.attachment.get("label", "")) or Path(path).stem or "Adjunto"
+
+        if att_type == "image":
+            self.viewer = PressImageViewer(path, label)
+            layout.addWidget(self.viewer, 1)
+        elif att_type == "video":
+            self.viewer = PressVideoViewer(path, label)
+            layout.addWidget(self.viewer, 1)
+        elif att_type == "document":
+            self.viewer = PressDocumentViewer(path, label)
+            layout.addWidget(self.viewer, 1)
+        elif att_type == "carousel":
+            items = list(self.attachment.get("items", []) or [])
+            self.viewer = PressCarouselViewer(items, label)
+            layout.addWidget(self.viewer, 1)
+        else:
+            fallback = PressDocumentViewer(path, label)
+            self.viewer = fallback
+            layout.addWidget(fallback, 1)
+
+    def closeEvent(self, event) -> None:
+        viewer = self.viewer
+        if isinstance(viewer, PressVideoViewer):
+            viewer.stop()
+        super().closeEvent(event)
+
+
 class PressIntroScreen(QWidget):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -2231,6 +2523,7 @@ class PressReaderScreen(QWidget):
         self.on_delete = on_delete
         self.current_note_id: int | None = None
         self._video_widgets: list[PressVideoViewer] = []
+        self._attachment_windows: list[PressAttachmentWindow] = []
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -2265,25 +2558,26 @@ class PressReaderScreen(QWidget):
         title_box = QVBoxLayout()
         title_box.setContentsMargins(0, 0, 0, 0)
         title_box.setSpacing(2)
-        title = QLabel("Notas de Prensa")
-        title.setObjectName("title")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        subtitle = QLabel("Vista de lectura editorial")
+        self.title_label = QLabel("Notas de Prensa")
+        self.title_label.setObjectName("title")
+        self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        subtitle = QLabel(" ")
         subtitle.setObjectName("muted")
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title_box.addWidget(title)
+        title_box.addWidget(self.title_label)
         title_box.addWidget(subtitle)
         header.addLayout(title_box, 1)
-        header.addStretch()
-
         self.menu_button = QToolButton()
         self.menu_button.setText("⋮")
         self.menu_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.menu_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.menu_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         self.menu_button.setAutoRaise(True)
-        self.menu_button.setMenu(QMenu(self))
-        header.addWidget(self.menu_button)
+        self.menu_button.setObjectName("pressMenuButton")
+        self.menu_button.setFixedSize(34, 34)
+        header.addWidget(self.menu_button, 0, alignment=Qt.AlignmentFlag.AlignTop)
+        header.addStretch()
+
         panel_layout.addLayout(header)
 
         self.scroll = QScrollArea()
@@ -2300,15 +2594,13 @@ class PressReaderScreen(QWidget):
     def show_note(self, note: dict) -> None:
         self.current_note_id = int(note.get("id", 0) or 0)
         self._rebuild_menu(note)
+        self.title_label.setText(str(note.get("title", "")) or "Sin título")
         self._clear_content()
-        title = QLabel(str(note.get("title", "")) or "Sin título")
-        title.setObjectName("transitionTitle")
-        title.setWordWrap(True)
-        self.content_layout.addWidget(title)
-        meta = QLabel(self._meta_text(note))
-        meta.setObjectName("muted")
-        meta.setWordWrap(True)
-        self.content_layout.addWidget(meta)
+
+        main_image = str(note.get("main_image", "")).strip()
+        if main_image:
+            self.content_layout.addWidget(PressImageViewer(main_image, ""))
+
         importance = str(note.get("importance", "")).strip()
         if importance:
             chip = QLabel(importance)
@@ -2317,11 +2609,17 @@ class PressReaderScreen(QWidget):
         body_html = str(note.get("body_html", "")).strip()
         if not body_html and note.get("blocks"):
             body_html, _ = _press_legacy_body_and_attachments(list(note.get("blocks", []) or []))
-        body = QTextEdit()
-        body.setReadOnly(True)
-        body.setAcceptRichText(True)
+        body = QTextBrowser()
+        body.setOpenExternalLinks(False)
+        body.setOpenLinks(False)
+        body.setStyleSheet(
+            "QTextBrowser { background: transparent; border: none; color: #dce9f6; }"
+            "QTextBrowser a { color: #4da3ff; text-decoration: none; }"
+            "QTextBrowser a:hover { text-decoration: underline; }"
+        )
         body.setHtml(body_html or "<p>Sin contenido.</p>")
         body.setMinimumHeight(280)
+        body.anchorClicked.connect(lambda url, payload=note: self._open_body_anchor(payload, url))
         self.content_layout.addWidget(body)
 
         attachments = list(note.get("attachments", []) or [])
@@ -2331,18 +2629,30 @@ class PressReaderScreen(QWidget):
             attachments_title = QLabel("Adjuntos")
             attachments_title.setObjectName("status")
             self.content_layout.addWidget(attachments_title)
+            attachments_wrap = QWidget()
+            attachments_wrap_layout = QVBoxLayout(attachments_wrap)
+            attachments_wrap_layout.setContentsMargins(0, 0, 0, 0)
+            attachments_wrap_layout.setSpacing(10)
+            attachment_icons = {"image": "🖼", "video": "🎬", "document": "📄"}
             for attachment in attachments:
-                att_type = str(attachment.get("type", "")).strip().lower()
                 path = str(attachment.get("path", "")).strip()
-                label = str(attachment.get("label", "")) or Path(path).stem
-                if att_type == "image":
-                    self.content_layout.addWidget(PressImageViewer(path, label))
-                elif att_type == "video":
-                    viewer = PressVideoViewer(path, label)
-                    self._video_widgets.append(viewer)
-                    self.content_layout.addWidget(viewer)
-                else:
-                    self.content_layout.addWidget(PressDocumentViewer(path, label))
+                label = str(attachment.get("label", "")) or Path(path).stem or "Adjunto"
+                file_name = Path(path).name or label
+                kind = str(attachment.get("type", "")).strip().lower()
+                icon = attachment_icons.get(kind, "📎")
+                btn = QPushButton(f"{icon}   {file_name}")
+                btn.setObjectName("pressAttachmentButton")
+                btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                btn.setToolTip(f"Abrir {label}")
+                btn.setMinimumHeight(42)
+                btn.clicked.connect(lambda _=False, payload=dict(attachment): self._open_attachment(payload))
+                attachments_wrap_layout.addWidget(btn)
+            self.content_layout.addWidget(attachments_wrap)
+        meta = QLabel(self._meta_text(note))
+        meta.setObjectName("muted")
+        meta.setWordWrap(True)
+        meta.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.content_layout.addWidget(meta)
         self.content_layout.addStretch()
         self.scroll.verticalScrollBar().setValue(0)
 
@@ -2362,9 +2672,70 @@ class PressReaderScreen(QWidget):
                     widget.stop()
                 widget.setParent(None)
         self._video_widgets.clear()
+        for window in list(self._attachment_windows):
+            if window is not None:
+                window.close()
+        self._attachment_windows.clear()
+
+    def _open_attachment(self, attachment: dict) -> None:
+        window = PressAttachmentWindow(attachment, parent=self.window())
+        window.destroyed.connect(lambda _=None, ref=window: self._forget_attachment_window(ref))
+        self._attachment_windows.append(window)
+        self._center_window(window)
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    def _find_attachment_for_path(self, note: dict, path: str) -> dict | None:
+        target = _resolve_press_path(path)
+        candidates = list(note.get("attachments", []) or [])
+        for attachment in candidates:
+            raw_path = str(attachment.get("path", "")).strip()
+            if not raw_path:
+                continue
+            if raw_path == path:
+                return dict(attachment)
+            if _resolve_press_path(raw_path) == target:
+                return dict(attachment)
+        main_image = str(note.get("main_image", "")).strip()
+        if main_image and _resolve_press_path(main_image) == target:
+            return {
+                "path": main_image,
+                "label": Path(main_image).stem or "Imagen principal",
+                "type": "image",
+            }
+        if target.exists():
+            return {
+                "path": path,
+                "label": target.stem or "Adjunto",
+                "type": _press_media_kind_for_path(target),
+            }
+        return None
+
+    def _open_body_anchor(self, note: dict, url: QUrl) -> None:
+        path = _press_decode_attachment_ref(url.toString())
+        if not path:
+            return
+        attachment = self._find_attachment_for_path(note, path)
+        if attachment is not None:
+            self._open_attachment(attachment)
+
+    def _forget_attachment_window(self, window: PressAttachmentWindow) -> None:
+        self._attachment_windows = [item for item in self._attachment_windows if item is not window]
+
+    def _center_window(self, window: QWidget) -> None:
+        screen = self.window().screen() if self.window() is not None else QApplication.primaryScreen()
+        if screen is None:
+            return
+        geo = screen.availableGeometry()
+        size = window.frameGeometry()
+        x = geo.x() + (geo.width() - size.width()) // 2
+        y = geo.y() + (geo.height() - size.height()) // 2
+        window.move(max(geo.x(), x), max(geo.y(), y))
 
     def _rebuild_menu(self, note: dict) -> None:
         menu = QMenu(self)
+        menu.setObjectName("pressNoteMenu")
         edit_action = QAction("Editar", self)
         delete_action = QAction("Eliminar", self)
         edit_action.triggered.connect(lambda: self.on_edit(note))
@@ -2418,7 +2789,7 @@ class PressListScreen(QWidget):
         title = QLabel("Notas de Prensa")
         title.setObjectName("title")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        subtitle = QLabel("Buscador, listado y gestión editorial")
+        subtitle = QLabel(" ")
         subtitle.setObjectName("muted")
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title_box.addWidget(title)
@@ -2449,8 +2820,8 @@ class PressListScreen(QWidget):
         self.scroll.setStyleSheet("background: transparent; border: none;")
         self.scroll_content = QWidget()
         self.cards_layout = QVBoxLayout(self.scroll_content)
-        self.cards_layout.setContentsMargins(0, 0, 0, 0)
-        self.cards_layout.setSpacing(12)
+        self.cards_layout.setContentsMargins(0, 4, 0, 4)
+        self.cards_layout.setSpacing(18)
         self.scroll.setWidget(self.scroll_content)
         panel_layout.addWidget(self.scroll, 1)
 
@@ -2494,7 +2865,7 @@ class PressListScreen(QWidget):
         start = (self.current_page - 1) * self.page_size
         page_notes = notes[start:start + self.page_size]
         self._rebuild_cards(page_notes)
-        self.count_label.setText(f"{total} notas · Página {self.current_page}/{total_pages}")
+        self.count_label.setText(" ")
         self.page_info.setText(f"Página {self.current_page}/{total_pages}")
         self.empty_label.setVisible(total == 0)
         self.prev_btn.setEnabled(self.current_page > 1)
@@ -2515,9 +2886,17 @@ class PressListScreen(QWidget):
         if not notes:
             self.cards_layout.addWidget(self.empty_label)
             return
-        for note in notes:
+        for index, note in enumerate(notes):
             card = PressNoteCard(note, self.on_open_note, self._edit_note, self._delete_note)
             self.cards_layout.addWidget(card)
+            if index < len(notes) - 1:
+                separator = QFrame()
+                separator.setObjectName("pressSeparator")
+                separator.setFrameShape(QFrame.Shape.NoFrame)
+                separator.setFixedHeight(1)
+                separator.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+                separator.setStyleSheet("background-color: rgba(126, 164, 196, 165); margin: 0px 18px;")
+                self.cards_layout.addWidget(separator)
         self.cards_layout.addStretch()
 
     def _previous_page(self) -> None:
@@ -2604,6 +2983,8 @@ class PressModuleScreen(QWidget):
     def _show_list(self) -> None:
         self.stack.setCurrentWidget(self.list_screen)
         self.list_screen.refresh()
+        self.reader.title_label.setText("Notas de Prensa")
+        self._set_back_button_visible(True)
         self._position_back_button()
 
     def _open_note(self, note: dict, edit_mode: bool = False, delete_mode: bool = False) -> None:
@@ -2620,6 +3001,7 @@ class PressModuleScreen(QWidget):
             return
         self.reader.show_note(current)
         self.stack.setCurrentWidget(self.reader)
+        self._set_back_button_visible(False)
         self._position_back_button()
 
     def _create_note(self) -> None:
@@ -2629,6 +3011,11 @@ class PressModuleScreen(QWidget):
         self._open_editor(note)
 
     def _open_editor(self, note: dict | None = None) -> None:
+        for dialog in list(self._open_editors):
+            if dialog is not None and dialog.isVisible():
+                dialog.raise_()
+                dialog.activateWindow()
+                return
         dialog = PressEditorDialog(self.store, note, parent=None)
         dialog.saved.connect(lambda payload, source=dialog: self._on_editor_saved(source, payload))
         dialog.closed.connect(lambda source=dialog: self._release_editor(source))
@@ -2648,6 +3035,7 @@ class PressModuleScreen(QWidget):
         if self.reader.current_note_id == int(saved_note.get("id", 0) or 0):
             self.reader.show_note(saved_note)
             self.stack.setCurrentWidget(self.reader)
+            self._set_back_button_visible(False)
         else:
             self._show_list()
         self._release_editor(dialog)
@@ -2677,6 +3065,11 @@ class PressModuleScreen(QWidget):
         self.btn_back.adjustSize()
         self.btn_back.move(margin, self.height() - self.btn_back.height() - margin)
         self.btn_back.raise_()
+
+    def _set_back_button_visible(self, visible: bool) -> None:
+        self.btn_back.setVisible(visible)
+        if visible:
+            self.btn_back.raise_()
 
     def _position_editor(self, dialog: PressEditorDialog) -> None:
         screen = dialog.screen() or QApplication.primaryScreen()
@@ -6885,18 +7278,93 @@ def build_stylesheet() -> str:
         background: rgba(32, 18, 22, 224);
     }
     QFrame#pressCard {
-        background: rgba(14, 24, 36, 230);
-        border: 1px solid rgba(126, 164, 196, 84);
-        border-radius: 14px;
+        background: rgba(14, 24, 36, 214);
+        border: 1px solid rgba(126, 164, 196, 88);
+        border-left: 3px solid transparent;
+        border-radius: 16px;
     }
-    QFrame#pressCard:hover {
-        background: rgba(18, 31, 47, 245);
-        border-color: rgba(111, 196, 233, 140);
+    QFrame#pressCard:hover,
+    QFrame#pressCard[hovered="true"] {
+        background: rgba(8, 16, 25, 255);
+        border-color: rgba(137, 213, 241, 240);
+        border-left: 4px solid rgba(137, 213, 241, 245);
+    }
+    QFrame#pressSeparator {
+        background: rgba(126, 164, 196, 165);
+        min-height: 1px;
+        max-height: 1px;
+        border: none;
+        margin: 0px 18px;
+    }
+    QToolButton#pressMenuButton {
+        background: rgba(12, 21, 32, 220);
+        color: #edf6fb;
+        border: 1px solid rgba(126, 164, 196, 95);
+        border-radius: 17px;
+        padding: 0px;
+        font-size: 18px;
+        font-weight: 800;
+    }
+    QToolButton#pressMenuButton:hover {
+        background: rgba(23, 37, 51, 250);
+        border-color: rgba(137, 213, 241, 220);
+        color: #ffffff;
+    }
+    QToolButton#pressMenuButton:pressed {
+        background: rgba(32, 51, 70, 255);
+        border-color: rgba(163, 230, 248, 235);
+    }
+    QToolButton#pressMenuButton::menu-indicator {
+        image: none;
+        width: 0px;
+    }
+    QMenu#pressNoteMenu {
+        background: rgba(9, 16, 24, 248);
+        color: #edf6fb;
+        border: 1px solid rgba(126, 164, 196, 110);
+        border-radius: 10px;
+        padding: 4px;
+    }
+    QMenu#pressNoteMenu::item {
+        padding: 8px 18px;
+        margin: 2px 2px;
+        border-radius: 8px;
+        background: transparent;
+    }
+    QMenu#pressNoteMenu::item:selected,
+    QMenu#pressNoteMenu::item:hover {
+        background: rgba(23, 37, 51, 255);
+        color: #ffffff;
     }
     QFrame#pressBlock {
         background: rgba(12, 22, 34, 225);
         border: 1px solid rgba(126, 164, 196, 80);
         border-radius: 14px;
+    }
+    QPushButton#pressAttachmentButton {
+        text-align: left;
+        background: rgba(13, 23, 35, 210);
+        color: #e9f3fa;
+        border: 1px solid rgba(126, 164, 196, 84);
+        border-left: 3px solid transparent;
+        border-radius: 11px;
+        padding: 10px 14px;
+        font-size: 13px;
+        font-weight: 700;
+        text-decoration: none;
+        margin: 0px 0px 6px 0px;
+    }
+    QPushButton#pressAttachmentButton:hover {
+        background: rgba(24, 42, 60, 242);
+        border-color: rgba(137, 213, 241, 220);
+        border-left: 3px solid rgba(137, 213, 241, 235);
+        color: #ffffff;
+        text-decoration: underline;
+    }
+    QPushButton#pressAttachmentButton:pressed {
+        background: rgba(30, 52, 73, 245);
+        border-color: rgba(163, 230, 248, 210);
+        border-left: 3px solid rgba(163, 230, 248, 240);
     }
     QPushButton#pressFab {
         background: #1d6f91;
