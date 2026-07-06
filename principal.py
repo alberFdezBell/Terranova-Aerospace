@@ -27,7 +27,7 @@ from PyQt6.QtCore import QPointF
 from PyQt6.QtGui import QMouseEvent
 from PySide6.QtCore import QVariantAnimation
 
-from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, QRect, QSize, Qt, QTimer, QThread, pyqtSignal, QDate
+from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, QRect, QSize, Qt, QTimer, QThread, pyqtSignal, pyqtProperty, QDate
 from PyQt6.QtCore import QUrl
 from PyQt6.QtGui import QAction, QColor, QDesktopServices, QIcon, QPainter, QPen, QPixmap, QPalette, QFont, QCursor, QVector3D, QFontMetrics, QBrush
 from PyQt6.QtWidgets import (
@@ -102,6 +102,7 @@ LOGO_PATH = BASE_DIR / "icons" / "tas.png"
 LOGO_PATH_CORT = BASE_DIR / "icons" / "tas_cortado.png"
 CONFIG_DIR = BASE_DIR / "config"
 USER_FILE = CONFIG_DIR / "user.dat"
+PANEL_IMAGE_DIR = BASE_DIR / "icons" / "panel"
 
 HASH_ITERATIONS = 240_000
 
@@ -112,6 +113,15 @@ MODULES: dict[str, str | None] = {
     "Programación": None,
     "Centro de mando": None,
     "Personal": None,
+}
+
+MODULE_PANEL_IMAGES: dict[str, str] = {
+    "Mapa orbital": "1.png",
+    "Notas de prensa": "2.png",
+    "Lista de satélites": "3.png",
+    "Programación": "4.png",
+    "Centro de mando": "5.png",
+    "Personal": "6.png",
 }
 
 INITIAL_STATUS = [
@@ -555,15 +565,15 @@ class StartupLoadingScreen(QWidget):
         self.on_finished()
 
 
-class ModuleCard(QPushButton):
+class _LegacyModuleCard(QPushButton):
     def __init__(self, title: str, available: bool, parent: QWidget | None = None):
         super().__init__(title, parent)
         self.available = available
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setMinimumHeight(118)
+        self.setFixedHeight(118)
         self.setObjectName("moduleCard" if available else "moduleCardDisabled")
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self._base_geometry = QRect()
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
     def enterEvent(self, event) -> None:
         super().enterEvent(event)
@@ -574,17 +584,163 @@ class ModuleCard(QPushButton):
         self._animate_hover(False)
 
     def _animate_hover(self, active: bool) -> None:
+        # Evitar cambios de geometría: en un grid puede hacer que las cards
+        # salten o desaparezcan al recalcular el layout.
         if not self.isEnabled():
             return
-        if self._base_geometry.isNull():
-            self._base_geometry = self.geometry()
-        rect = self._base_geometry.adjusted(-3, -3, 3, 3) if active else self._base_geometry
-        animation = QPropertyAnimation(self, b"geometry", self)
-        animation.setDuration(150)
-        animation.setEndValue(rect)
-        animation.setEasingCurve(QEasingCurve.Type.OutCubic)
-        self._hover_animation = animation
-        animation.start()
+        self.setProperty("hovered", active)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+
+
+class ModuleCardImagePanel(QWidget):
+    zoomChanged = pyqtSignal()
+
+    def __init__(self, pixmap: QPixmap, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._source_pixmap = pixmap
+        self._zoom = 1.0
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._zoom_anim = QPropertyAnimation(self, b"zoom", self)
+        self._zoom_anim.setDuration(180)
+        self._zoom_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+    def sizeHint(self) -> QSize:
+        return QSize(320, 186)
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(240, 160)
+
+    def getZoom(self) -> float:
+        return self._zoom
+
+    def setZoom(self, value: float) -> None:
+        value = max(1.0, min(1.08, float(value)))
+        if abs(self._zoom - value) < 0.0001:
+            return
+        self._zoom = value
+        self.zoomChanged.emit()
+        self.update()
+
+    zoom = pyqtProperty(float, fget=getZoom, fset=setZoom, notify=zoomChanged)
+
+    def set_hover(self, active: bool) -> None:
+        self._zoom_anim.stop()
+        self._zoom_anim.setStartValue(self._zoom)
+        self._zoom_anim.setEndValue(1.06 if active else 1.0)
+        self._zoom_anim.start()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setClipRect(self.rect())
+
+        rect = self.rect()
+        if self._source_pixmap.isNull():
+            painter.fillRect(rect, QColor(8, 15, 24))
+            painter.fillRect(rect, QColor(18, 33, 48, 110))
+            return
+
+        target_size = QSize(
+            max(1, int(rect.width() * self._zoom)),
+            max(1, int(rect.height() * self._zoom)),
+        )
+        scaled = self._source_pixmap.scaled(
+            target_size,
+            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        x = (rect.width() - scaled.width()) // 2
+        y = (rect.height() - scaled.height()) // 2
+        painter.drawPixmap(x, y, scaled)
+        painter.fillRect(rect, QColor(6, 13, 20, 40))
+        painter.fillRect(rect.adjusted(0, rect.height() - 52, 0, 0), QColor(8, 12, 18, 70))
+
+
+class ModuleCard(QWidget):
+    clicked = pyqtSignal()
+
+    def __init__(self, title: str, available: bool, image_name: str | None = None, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.title = title
+        self.available = available
+        self.image_name = image_name
+        self.setObjectName("moduleCard" if available else "moduleCardDisabled")
+        self.setCursor(Qt.CursorShape.PointingHandCursor if available else Qt.CursorShape.ArrowCursor)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setFixedHeight(250)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self.setMouseTracking(True)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        self.image_panel = ModuleCardImagePanel(self._load_pixmap())
+        self.image_panel.setObjectName("moduleCardImagePanel")
+        self.image_panel.setMinimumHeight(164)
+        self.image_panel.setMaximumHeight(164)
+        root.addWidget(self.image_panel, 1)
+
+        self.text_panel = QFrame()
+        self.text_panel.setObjectName("moduleCardTextPanel")
+        self.text_panel.setFixedHeight(86)
+        self.text_panel.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        text_layout = QVBoxLayout(self.text_panel)
+        text_layout.setContentsMargins(18, 12, 18, 12)
+        text_layout.setSpacing(2)
+
+        self.title_label = QLabel(title)
+        self.title_label.setObjectName("moduleCardTitle")
+        self.title_label.setWordWrap(True)
+        self.title_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.subtitle_label = QLabel(self._subtitle_text())
+        self.subtitle_label.setObjectName("moduleCardSubtitle")
+        self.subtitle_label.setWordWrap(True)
+        self.subtitle_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
+        text_layout.addWidget(self.title_label)
+        text_layout.addWidget(self.subtitle_label)
+        text_layout.addStretch()
+        root.addWidget(self.text_panel)
+
+    def _subtitle_text(self) -> str:
+        if self.available:
+            return "Módulo disponible para abrir."
+        return "Módulo no disponible actualmente."
+
+    def _load_pixmap(self) -> QPixmap:
+        candidates: list[Path] = []
+        if self.image_name:
+            candidates.append(PANEL_IMAGE_DIR / self.image_name)
+        candidates.extend([LOGO_PATH_CORT, LOGO_PATH])
+        for path in candidates:
+            if path.exists():
+                pixmap = QPixmap(str(path))
+                if not pixmap.isNull():
+                    return pixmap
+        return QPixmap()
+
+    def enterEvent(self, event) -> None:
+        super().enterEvent(event)
+        if self.available:
+            self.image_panel.set_hover(True)
+
+    def leaveEvent(self, event) -> None:
+        super().leaveEvent(event)
+        self.image_panel.set_hover(False)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if self.available and event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
 
 class CommandCenter(QWidget):
@@ -649,8 +805,8 @@ class CommandCenter(QWidget):
         self.grid.setContentsMargins(0, 0, 0, 0)
         self.module_cards: list[ModuleCard] = []
         for index, (name, target) in enumerate(MODULES.items()):
-            card = ModuleCard(name, bool(target))
-            card.clicked.connect(lambda checked=False, module=name: self.on_module_selected(module))
+            card = ModuleCard(name, bool(target), MODULE_PANEL_IMAGES.get(name))
+            card.clicked.connect(lambda module=name: self.on_module_selected(module))
             self.module_cards.append(card)
             row, col = divmod(index, 3)
             self.grid.addWidget(card, row, col)
@@ -780,6 +936,45 @@ def _press_summary_from_blocks(blocks: list[dict], limit: int = 140) -> str:
     return "Sin resumen disponible."
 
 
+def _press_summary_from_text(body_html: str, limit: int = 140) -> str:
+    plain = _press_plain_text_from_html(body_html)
+    if not plain:
+        return "Sin resumen disponible."
+    return _shorten_text(plain.replace("\n", " "), limit)
+
+
+def _press_legacy_body_and_attachments(blocks: list[dict]) -> tuple[str, list[dict]]:
+    text_parts: list[str] = []
+    attachments: list[dict] = []
+    for block in blocks:
+        block_type = str(block.get("type", "")).strip().lower()
+        if block_type == "text":
+            html = str(block.get("html") or "")
+            plain = str(block.get("plain") or _press_plain_text_from_html(html)).strip()
+            text_parts.append(html.strip() or plain)
+            continue
+        if block_type == "carousel":
+            for item in list(block.get("items", []) or []):
+                path = str(item.get("path", "")).strip()
+                if path:
+                    attachments.append({
+                        "path": path,
+                        "label": str(item.get("label") or Path(path).stem or "Imagen").strip(),
+                        "type": "image",
+                    })
+            continue
+        path = str(block.get("path", "")).strip()
+        if path:
+            media_type = block_type if block_type in {"image", "video", "document"} else _press_media_kind_for_path(Path(path))
+            attachments.append({
+                "path": path,
+                "label": str(block.get("label") or Path(path).stem or "Archivo").strip(),
+                "type": media_type,
+            })
+    body_html = "\n".join(part for part in text_parts if part).strip()
+    return body_html, attachments
+
+
 def _press_media_kind_for_path(path: Path) -> str:
     suffix = path.suffix.lower()
     if suffix in {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"}:
@@ -876,7 +1071,8 @@ class PressStore:
             str(note.get("author", "")),
             str(note.get("date", "")),
             str(note.get("importance", "")),
-            _press_summary_from_blocks(list(note.get("blocks", []) or [])),
+            _press_summary_from_text(str(note.get("body_html", ""))),
+            " ".join(str(a.get("label", "")) for a in list(note.get("attachments", []) or [])),
         ])
         return term in _normalize_key(haystack)
 
@@ -893,21 +1089,34 @@ class PressStore:
             if note_id <= 0:
                 note_id = self._allocate_id()
             max_id = max(max_id, note_id)
-            blocks = self._normalize_blocks(note_id, list(note.get("blocks", []) or []), import_media=import_media)
+            legacy_blocks = list(note.get("blocks", []) or [])
+            body_html = str(note.get("body_html", "")).strip()
+            attachments = list(note.get("attachments", []) or [])
+            if legacy_blocks and not body_html and not attachments:
+                body_html, attachments = _press_legacy_body_and_attachments(legacy_blocks)
+            body_html = self._normalize_body_html(body_html)
+            attachments = self._normalize_attachments(note_id, attachments, import_media=import_media)
             normalized.append({
                 "id": note_id,
                 "title": str(note.get("title", "")).strip(),
                 "author": str(note.get("author", "")).strip(),
                 "date": self._normalize_date(str(note.get("date", "")).strip()),
                 "importance": str(note.get("importance", "")).strip(),
-                "blocks": blocks,
-                "summary": str(note.get("summary") or _press_summary_from_blocks(blocks)),
+                "body_html": body_html,
+                "attachments": attachments,
+                "summary": str(note.get("summary") or _press_summary_from_text(body_html)),
                 "created_at": float(note.get("created_at") or time.time()),
                 "updated_at": float(note.get("updated_at") or note.get("created_at") or time.time()),
             })
         self.notes = sorted(normalized, key=self._sort_key, reverse=True)
         if self.next_id <= max_id:
             self.next_id = max_id + 1
+
+    def _normalize_body_html(self, body_html: str) -> str:
+        body_html = str(body_html or "").strip()
+        if not body_html:
+            return ""
+        return body_html
 
     def _normalize_date(self, value: str) -> str:
         if not value:
@@ -944,55 +1153,32 @@ class PressStore:
         shutil.copy2(source, destination)
         return _press_relativize_path(destination)
 
-    def _normalize_blocks(self, note_id: int, blocks: list[dict], import_media: bool) -> list[dict]:
+    def _normalize_attachments(self, note_id: int, attachments: list[dict], import_media: bool) -> list[dict]:
         normalized: list[dict] = []
-        for block in blocks:
-            block_type = str(block.get("type", "")).strip().lower()
-            if block_type == "text":
-                html = str(block.get("html") or "")
-                plain = str(block.get("plain") or _press_plain_text_from_html(html))
-                if not html.strip() and not plain.strip():
-                    continue
-                normalized.append({"type": "text", "html": html, "plain": plain})
-                continue
-            if block_type == "carousel":
-                items: list[dict] = []
-                for entry in list(block.get("items", []) or []):
-                    raw_path = str(entry.get("path", "")).strip()
-                    if not raw_path:
-                        continue
-                    resolved = _resolve_press_path(raw_path)
-                    if resolved.exists() and import_media:
-                        raw_path = self._import_media_file(note_id, str(resolved), "image")
-                    elif resolved.is_absolute():
-                        raw_path = _press_relativize_path(resolved)
-                    label = str(entry.get("label") or resolved.stem or "Imagen").strip()
-                    items.append({"path": raw_path, "label": label})
-                normalized.append({
-                    "type": "carousel",
-                    "label": str(block.get("label") or "Carrusel").strip(),
-                    "items": items,
-                })
-                continue
-            raw_path = str(block.get("path", "")).strip()
+        for entry in attachments:
+            raw_path = str(entry.get("path", "")).strip()
             if not raw_path:
                 continue
             resolved = _resolve_press_path(raw_path)
-            media_type = "image" if block_type == "image" else "video" if block_type == "video" else "document"
+            attachment_type = str(entry.get("type") or _press_media_kind_for_path(resolved)).strip().lower()
+            if attachment_type not in {"image", "video", "document"}:
+                attachment_type = _press_media_kind_for_path(resolved)
             if resolved.exists() and import_media:
-                raw_path = self._import_media_file(note_id, str(resolved), media_type)
+                raw_path = self._import_media_file(note_id, str(resolved), attachment_type)
             elif resolved.is_absolute():
                 raw_path = _press_relativize_path(resolved)
             normalized.append({
-                "type": media_type,
                 "path": raw_path,
-                "label": str(block.get("label") or resolved.stem or "Archivo").strip(),
+                "label": str(entry.get("label") or resolved.stem or "Archivo").strip(),
+                "type": attachment_type,
             })
         return normalized
 
     def _iter_media_paths(self) -> set[Path]:
         paths: set[Path] = set()
         for note in self.notes:
+            for attachment in list(note.get("attachments", []) or []):
+                self._collect_media_path(paths, str(attachment.get("path", "")))
             for block in list(note.get("blocks", []) or []):
                 if block.get("type") == "carousel":
                     for item in list(block.get("items", []) or []):
@@ -1564,15 +1750,24 @@ class PressBlockEditor(QWidget):
         self.add_media_block(media_kind, data, index=insert_index)
 
 
-class PressEditorDialog(QDialog):
+class PressEditorDialog(QWidget):
+    saved = pyqtSignal(dict)
+    closed = pyqtSignal()
+
     def __init__(self, store: PressStore, note: dict | None = None, parent: QWidget | None = None):
         title = "Editar nota" if note else "Nueva nota"
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.setModal(True)
-        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+        self.setWindowFlags(
+            Qt.WindowType.Window
+            | Qt.WindowType.WindowTitleHint
+            | Qt.WindowType.WindowSystemMenuHint
+            | Qt.WindowType.WindowMinMaxButtonsHint
+            | Qt.WindowType.WindowCloseButtonHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.resize(920, 780)
-        self.setStyleSheet("QDialog { background: #07111d; }")
+        self.setStyleSheet("QWidget { background: #07111d; }")
         self.store = store
         self.note = dict(note or {})
         self.note_id = int(self.note.get("id", 0) or 0)
@@ -1603,13 +1798,13 @@ class PressEditorDialog(QDialog):
         header.addStretch()
         close_button = QPushButton("Cerrar")
         close_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        close_button.clicked.connect(self.reject)
+        close_button.clicked.connect(self.close)
         header.addWidget(close_button)
         panel_layout.addLayout(header)
 
-        self.body_layout = QVBoxLayout()
-        self.body_layout.setSpacing(12)
-        panel_layout.addLayout(self.body_layout)
+        body_header = QLabel("Redacción de la nota")
+        body_header.setObjectName("status")
+        panel_layout.addWidget(body_header)
 
         grid = QGridLayout()
         grid.setHorizontalSpacing(12)
@@ -1632,34 +1827,118 @@ class PressEditorDialog(QDialog):
         grid.addWidget(self.date_edit, 1, 1)
         grid.addWidget(QLabel("Importancia"), 1, 2)
         grid.addWidget(self.importance_edit, 1, 3)
-        self.body_layout.addLayout(grid)
+        panel_layout.addLayout(grid)
 
-        self.editor = PressBlockEditor()
-        self.editor.set_blocks(list(self.note.get("blocks", []) or []))
-        self.body_layout.addWidget(self.editor, 1)
+        self.editor = QTextEdit()
+        self.editor.setPlaceholderText("Escribe aquí la nota de prensa...")
+        self.editor.setAcceptRichText(True)
+        self.editor.setMinimumHeight(300)
+        legacy_body = str(self.note.get("body_html", "")).strip()
+        if not legacy_body and self.note.get("blocks"):
+            legacy_body, _ = _press_legacy_body_and_attachments(list(self.note.get("blocks", []) or []))
+        if legacy_body:
+            self.editor.setHtml(legacy_body)
+        panel_layout.addWidget(self.editor, 1)
+
+        attachments_title = QLabel("Adjuntos al final")
+        attachments_title.setObjectName("status")
+        panel_layout.addWidget(attachments_title)
+
+        self.attachments = QListWidget()
+        self.attachments.setMinimumHeight(150)
+        self.attachments.setAlternatingRowColors(True)
+        self.attachments.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self._load_attachments()
+        panel_layout.addWidget(self.attachments)
+
+        attachment_buttons = QHBoxLayout()
+        add_attachment_btn = QPushButton("Añadir archivos")
+        add_attachment_btn.clicked.connect(self._add_attachment)
+        remove_attachment_btn = QPushButton("Eliminar archivo")
+        remove_attachment_btn.clicked.connect(self._remove_attachment)
+        attachment_buttons.addWidget(add_attachment_btn)
+        attachment_buttons.addWidget(remove_attachment_btn)
+        attachment_buttons.addStretch()
+        panel_layout.addLayout(attachment_buttons)
 
         footer = QHBoxLayout()
         footer.addStretch()
         cancel_btn = QPushButton("Cancelar")
-        cancel_btn.clicked.connect(self.reject)
+        cancel_btn.clicked.connect(self.close)
         save_btn = QPushButton("Guardar")
         save_btn.setObjectName("primaryButton")
-        save_btn.clicked.connect(self.accept)
+        save_btn.clicked.connect(self._save_note)
         footer.addWidget(cancel_btn)
         footer.addWidget(save_btn)
-        self.body_layout.addLayout(footer)
+        panel_layout.addLayout(footer)
 
         fade_in(self.panel, 180)
 
+    def _load_attachments(self) -> None:
+        self.attachments.clear()
+        for attachment in list(self.note.get("attachments", []) or []):
+            path = str(attachment.get("path", "")).strip()
+            if not path:
+                continue
+            label = str(attachment.get("label") or Path(path).stem or "Archivo").strip()
+            kind = str(attachment.get("type") or _press_media_kind_for_path(_resolve_press_path(path))).strip().lower()
+            item = QListWidgetItem(f"{label} · {kind.upper()}")
+            item.setData(Qt.ItemDataRole.UserRole, {"path": path, "label": label, "type": kind})
+            self.attachments.addItem(item)
+
+    def _add_attachment(self) -> None:
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Añadir adjuntos",
+            str(BASE_DIR),
+            "Todos los archivos (*)",
+        )
+        for file_name in files:
+            if not file_name:
+                continue
+            path = Path(file_name)
+            kind = _press_media_kind_for_path(path)
+            label = path.stem
+            item = QListWidgetItem(f"{label} · {kind.upper()}")
+            item.setData(Qt.ItemDataRole.UserRole, {"path": str(path), "label": label, "type": kind})
+            self.attachments.addItem(item)
+
+    def _remove_attachment(self) -> None:
+        row = self.attachments.currentRow()
+        if row >= 0:
+            self.attachments.takeItem(row)
+
+    def _save_note(self) -> None:
+        payload = self.result_payload()
+        if not payload["title"]:
+            QMessageBox.warning(self, APP_NAME, "El título es obligatorio.")
+            return
+        self.saved.emit(payload)
+        self.close()
+
     def result_payload(self) -> dict:
+        attachments = []
+        for index in range(self.attachments.count()):
+            item = self.attachments.item(index)
+            payload = item.data(Qt.ItemDataRole.UserRole) or {}
+            attachments.append({
+                "path": str(payload.get("path", "")).strip(),
+                "label": str(payload.get("label", "")).strip(),
+                "type": str(payload.get("type", "")).strip().lower() or _press_media_kind_for_path(Path(str(payload.get("path", "")))),
+            })
         return {
             "id": self.note_id,
             "title": self.title_edit.text().strip(),
             "author": self.author_edit.text().strip(),
             "date": self.date_edit.date().toString("yyyy-MM-dd"),
             "importance": self.importance_edit.text().strip(),
-            "blocks": self.editor.blocks(),
+            "body_html": self.editor.toHtml().strip(),
+            "attachments": attachments,
         }
+
+    def closeEvent(self, event) -> None:
+        self.closed.emit()
+        super().closeEvent(event)
 
 
 class PressNoteCard(QFrame):
@@ -1707,7 +1986,7 @@ class PressNoteCard(QFrame):
             chip.setObjectName("stateChip")
             layout.addWidget(chip, alignment=Qt.AlignmentFlag.AlignLeft)
 
-        summary = QLabel(str(self.note.get("summary") or _press_summary_from_blocks(list(self.note.get("blocks", []) or []))))
+        summary = QLabel(str(self.note.get("summary") or _press_summary_from_text(str(self.note.get("body_html", "")))))
         summary.setWordWrap(True)
         summary.setObjectName("muted")
         layout.addWidget(summary)
@@ -1904,72 +2183,42 @@ class PressDocumentViewer(QFrame):
 class PressIntroScreen(QWidget):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
-        self._progress = 0.0
         self._finish_callback = None
         self.timer = QTimer(self)
-        self.timer.timeout.connect(self._tick)
         self._build_ui()
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 24, 24, 24)
-        layout.setSpacing(18)
+        layout.setSpacing(20)
         layout.addStretch()
-        layout.addWidget(LogoLabel(QSize(460, 170)), alignment=Qt.AlignmentFlag.AlignCenter)
-        self.orbit = OrbitalLoader()
-        layout.addWidget(self.orbit, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        self.logo = LogoLabel(QSize(460, 170))
+        self.logo.setMinimumHeight(170)
+        layout.addWidget(self.logo, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        self.spinner = SpinnerWidget(74)
+        layout.addWidget(self.spinner, alignment=Qt.AlignmentFlag.AlignCenter)
+
         title = QLabel("Notas de Prensa")
         title.setObjectName("transitionTitle")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(title)
+
         subtitle = QLabel("Sincronizando archivo editorial")
         subtitle.setObjectName("muted")
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(subtitle)
+
         layout.addStretch()
 
     def start(self, finished_callback) -> None:
         self._finish_callback = finished_callback
-        self._progress = 0.0
-        self.timer.start(16)
         QTimer.singleShot(1400, self._finish)
 
-    def _tick(self) -> None:
-        self._progress = min(1.0, self._progress + 0.02)
-        self.update()
-        if self._progress >= 1.0:
-            self.timer.stop()
-
     def _finish(self) -> None:
-        self.timer.stop()
         if self._finish_callback is not None:
             self._finish_callback()
-
-    def paintEvent(self, event) -> None:
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.fillRect(self.rect(), QColor("#07111d"))
-        center = self.rect().center()
-        painter.setPen(QPen(QColor(59, 89, 119, 160), 1))
-        for radius in (86, 132, 188):
-            painter.drawEllipse(center, radius, radius)
-        painter.setPen(QPen(QColor(111, 196, 233, 180), 2))
-        orbit_angle = self._progress * 360.0
-        for offset, radius in [(0, 188), (42, 132), (118, 86)]:
-            rect = QRect(center.x() - radius, center.y() - radius, radius * 2, radius * 2)
-            painter.drawArc(rect, int((orbit_angle + offset) * 16), 120 * 16)
-        points = [
-            (math.cos(math.radians(orbit_angle)) * 188, math.sin(math.radians(orbit_angle)) * 188),
-            (math.cos(math.radians(orbit_angle + 42)) * 132, math.sin(math.radians(orbit_angle + 42)) * 132),
-            (math.cos(math.radians(orbit_angle + 118)) * 86, math.sin(math.radians(orbit_angle + 118)) * 86),
-        ]
-        painter.setPen(QPen(QColor(92, 144, 178, 150), 1))
-        painter.drawLine(int(center.x() + points[0][0]), int(center.y() + points[0][1]), int(center.x() + points[1][0]), int(center.y() + points[1][1]))
-        painter.drawLine(int(center.x() + points[1][0]), int(center.y() + points[1][1]), int(center.x() + points[2][0]), int(center.y() + points[2][1]))
-        painter.setBrush(QColor("#97f2de"))
-        painter.setPen(Qt.PenStyle.NoPen)
-        for px, py in points:
-            painter.drawEllipse(int(center.x() + px) - 5, int(center.y() + py) - 5, 10, 10)
 
 
 class PressReaderScreen(QWidget):
@@ -2007,8 +2256,8 @@ class PressReaderScreen(QWidget):
         header = QHBoxLayout()
         header.setContentsMargins(0, 0, 0, 0)
         header.setSpacing(10)
-        back_btn = QPushButton("Volver")
-        back_btn.setObjectName("primaryButton")
+        back_btn = QPushButton("← Lista")
+        back_btn.setObjectName("btnBack")
         back_btn.clicked.connect(self.back_clicked.emit)
         header.addWidget(back_btn)
         header.addStretch()
@@ -2065,24 +2314,35 @@ class PressReaderScreen(QWidget):
             chip = QLabel(importance)
             chip.setObjectName("stateChip")
             self.content_layout.addWidget(chip, alignment=Qt.AlignmentFlag.AlignLeft)
-        for block in list(note.get("blocks", []) or []):
-            block_type = str(block.get("type", "")).strip().lower()
-            if block_type == "text":
-                label = QLabel(str(block.get("html") or block.get("plain") or ""))
-                label.setWordWrap(True)
-                label.setTextFormat(Qt.TextFormat.RichText)
-                label.setOpenExternalLinks(True)
-                self.content_layout.addWidget(label)
-            elif block_type == "image":
-                self.content_layout.addWidget(PressImageViewer(str(block.get("path", "")), str(block.get("label", ""))))
-            elif block_type == "carousel":
-                self.content_layout.addWidget(PressCarouselViewer(list(block.get("items", []) or []), str(block.get("label", ""))))
-            elif block_type == "video":
-                viewer = PressVideoViewer(str(block.get("path", "")), str(block.get("label", "")))
-                self._video_widgets.append(viewer)
-                self.content_layout.addWidget(viewer)
-            elif block_type == "document":
-                self.content_layout.addWidget(PressDocumentViewer(str(block.get("path", "")), str(block.get("label", ""))))
+        body_html = str(note.get("body_html", "")).strip()
+        if not body_html and note.get("blocks"):
+            body_html, _ = _press_legacy_body_and_attachments(list(note.get("blocks", []) or []))
+        body = QTextEdit()
+        body.setReadOnly(True)
+        body.setAcceptRichText(True)
+        body.setHtml(body_html or "<p>Sin contenido.</p>")
+        body.setMinimumHeight(280)
+        self.content_layout.addWidget(body)
+
+        attachments = list(note.get("attachments", []) or [])
+        if not attachments and note.get("blocks"):
+            _, attachments = _press_legacy_body_and_attachments(list(note.get("blocks", []) or []))
+        if attachments:
+            attachments_title = QLabel("Adjuntos")
+            attachments_title.setObjectName("status")
+            self.content_layout.addWidget(attachments_title)
+            for attachment in attachments:
+                att_type = str(attachment.get("type", "")).strip().lower()
+                path = str(attachment.get("path", "")).strip()
+                label = str(attachment.get("label", "")) or Path(path).stem
+                if att_type == "image":
+                    self.content_layout.addWidget(PressImageViewer(path, label))
+                elif att_type == "video":
+                    viewer = PressVideoViewer(path, label)
+                    self._video_widgets.append(viewer)
+                    self.content_layout.addWidget(viewer)
+                else:
+                    self.content_layout.addWidget(PressDocumentViewer(path, label))
         self.content_layout.addStretch()
         self.scroll.verticalScrollBar().setValue(0)
 
@@ -2151,12 +2411,7 @@ class PressListScreen(QWidget):
         header = QHBoxLayout()
         header.setContentsMargins(0, 0, 0, 0)
         header.setSpacing(10)
-        back_btn = QPushButton("Volver")
-        back_btn.setObjectName("primaryButton")
-        back_btn.clicked.connect(self.back_clicked.emit)
-        header.addWidget(back_btn)
         header.addStretch()
-
         title_box = QVBoxLayout()
         title_box.setContentsMargins(0, 0, 0, 0)
         title_box.setSpacing(2)
@@ -2205,16 +2460,17 @@ class PressListScreen(QWidget):
         self.cards_layout.addWidget(self.empty_label)
 
         pagination = QHBoxLayout()
+        pagination.setSpacing(10)
+        self.page_info = QLabel("Página 1/1")
+        self.page_info.setObjectName("muted")
         self.prev_btn = QPushButton("Anterior")
         self.next_btn = QPushButton("Siguiente")
-        self.prev_btn.setObjectName("primaryButton")
-        self.next_btn.setObjectName("primaryButton")
         self.prev_btn.clicked.connect(self._previous_page)
         self.next_btn.clicked.connect(self._next_page)
-        self.pages_container = QHBoxLayout()
         pagination.addWidget(self.prev_btn)
-        pagination.addLayout(self.pages_container, 1)
         pagination.addWidget(self.next_btn)
+        pagination.addWidget(self.page_info)
+        pagination.addStretch()
         panel_layout.addLayout(pagination)
 
         self.fab = QPushButton("+")
@@ -2238,8 +2494,8 @@ class PressListScreen(QWidget):
         start = (self.current_page - 1) * self.page_size
         page_notes = notes[start:start + self.page_size]
         self._rebuild_cards(page_notes)
-        self._rebuild_pagination(total_pages)
         self.count_label.setText(f"{total} notas · Página {self.current_page}/{total_pages}")
+        self.page_info.setText(f"Página {self.current_page}/{total_pages}")
         self.empty_label.setVisible(total == 0)
         self.prev_btn.setEnabled(self.current_page > 1)
         self.next_btn.setEnabled(self.current_page < total_pages)
@@ -2263,28 +2519,6 @@ class PressListScreen(QWidget):
             card = PressNoteCard(note, self.on_open_note, self._edit_note, self._delete_note)
             self.cards_layout.addWidget(card)
         self.cards_layout.addStretch()
-
-    def _rebuild_pagination(self, total_pages: int) -> None:
-        self._clear_layout(self.pages_container)
-        max_buttons = 7
-        if total_pages <= max_buttons:
-            pages = range(1, total_pages + 1)
-        else:
-            start = max(1, self.current_page - 2)
-            end = min(total_pages, start + 4)
-            start = max(1, end - 4)
-            pages = range(start, end + 1)
-        for page in pages:
-            btn = QPushButton(str(page))
-            btn.setCheckable(True)
-            btn.setChecked(page == self.current_page)
-            btn.clicked.connect(lambda _=False, p=page: self._go_to_page(p))
-            self.pages_container.addWidget(btn)
-        self.pages_container.addStretch()
-
-    def _go_to_page(self, page: int) -> None:
-        self.current_page = page
-        self.refresh()
 
     def _previous_page(self) -> None:
         if self.current_page > 1:
@@ -2315,6 +2549,7 @@ class PressModuleScreen(QWidget):
         super().__init__(parent)
         self.on_back_to_command_center = on_back_to_command_center
         self.store = PressStore()
+        self._open_editors: list[PressEditorDialog] = []
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -2334,6 +2569,27 @@ class PressModuleScreen(QWidget):
         self.stack.addWidget(self.reader)
         self.stack.setCurrentWidget(self.list_screen)
 
+        self.btn_back = QPushButton("← Volver", self)
+        self.btn_back.setObjectName("btnBack")
+        self.btn_back.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_back.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                border: none;
+                color: #FFFFFF;
+                text-decoration: none;
+                padding: 2px 4px;
+            }
+            QPushButton:hover {
+                text-decoration: underline;
+            }
+        """)
+        self.btn_back.clicked.connect(self.on_back_to_command_center)
+        self.btn_back.adjustSize()
+        self.btn_back.show()
+        self.btn_back.raise_()
+        self._position_back_button()
+
     def start(self) -> None:
         self.stack.setCurrentWidget(self.intro)
         self.intro.start(self._show_list)
@@ -2348,7 +2604,7 @@ class PressModuleScreen(QWidget):
     def _show_list(self) -> None:
         self.stack.setCurrentWidget(self.list_screen)
         self.list_screen.refresh()
-        fade_in(self.list_screen, 260)
+        self._position_back_button()
 
     def _open_note(self, note: dict, edit_mode: bool = False, delete_mode: bool = False) -> None:
         note_id = int(note.get("id", 0) or 0)
@@ -2364,37 +2620,38 @@ class PressModuleScreen(QWidget):
             return
         self.reader.show_note(current)
         self.stack.setCurrentWidget(self.reader)
-        fade_in(self.reader, 260)
+        self._position_back_button()
 
     def _create_note(self) -> None:
-        dialog = PressEditorDialog(self.store, parent=self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        payload = dialog.result_payload()
-        if not payload["title"]:
-            QMessageBox.warning(self, APP_NAME, "El título es obligatorio.")
-            return
-        self.store.upsert_note(payload)
-        self.refresh()
-        self._show_list()
+        self._open_editor()
 
     def _edit_note(self, note: dict) -> None:
-        dialog = PressEditorDialog(self.store, note, parent=self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        payload = dialog.result_payload()
-        payload["id"] = note.get("id", 0)
-        if not payload["title"]:
-            QMessageBox.warning(self, APP_NAME, "El título es obligatorio.")
-            return
-        self.store.upsert_note(payload)
+        self._open_editor(note)
+
+    def _open_editor(self, note: dict | None = None) -> None:
+        dialog = PressEditorDialog(self.store, note, parent=None)
+        dialog.saved.connect(lambda payload, source=dialog: self._on_editor_saved(source, payload))
+        dialog.closed.connect(lambda source=dialog: self._release_editor(source))
+        self._open_editors.append(dialog)
+        self._position_editor(dialog)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _release_editor(self, dialog: PressEditorDialog) -> None:
+        if dialog in self._open_editors:
+            self._open_editors.remove(dialog)
+
+    def _on_editor_saved(self, dialog: PressEditorDialog, payload: dict) -> None:
+        saved_note = self.store.upsert_note(payload)
         self.refresh()
-        updated = self.store.get_note(int(note.get("id", 0) or 0))
-        if updated is not None:
-            self.reader.show_note(updated)
+        if self.reader.current_note_id == int(saved_note.get("id", 0) or 0):
+            self.reader.show_note(saved_note)
             self.stack.setCurrentWidget(self.reader)
         else:
             self._show_list()
+        self._release_editor(dialog)
+        self._position_back_button()
 
     def _delete_note(self, note: dict) -> None:
         answer = QMessageBox.question(
@@ -2409,6 +2666,26 @@ class PressModuleScreen(QWidget):
         self.store.delete_note(int(note.get("id", 0) or 0))
         self.refresh()
         self._show_list()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._position_back_button()
+
+    def _position_back_button(self) -> None:
+        # Sube o baja este valor si quieres acercar o alejar el botón del borde inferior.
+        margin = 0
+        self.btn_back.adjustSize()
+        self.btn_back.move(margin, self.height() - self.btn_back.height() - margin)
+        self.btn_back.raise_()
+
+    def _position_editor(self, dialog: PressEditorDialog) -> None:
+        screen = dialog.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        frame = dialog.frameGeometry()
+        frame.moveCenter(available.center())
+        dialog.move(frame.topLeft())
 
 
 def _format_ksp_ut(seconds: float | None) -> str:
@@ -2658,13 +2935,101 @@ class SatelliteStore:
         parts = [
             _normalize_key(name),
             launch_part,
-            f"{float(orbit.get('periapsis_km', 0) or 0):.6f}",
-            f"{float(orbit.get('apoapsis_km', 0) or 0):.6f}",
-            f"{float(orbit.get('inclination_deg', 0) or 0):.6f}",
-            f"{float(orbit.get('period_s', 0) or 0):.6f}",
-            f"{float(orbit.get('eccentricity', 0) or 0):.6f}",
+            f"{float(orbit.get('periapsis_km', 0) or 0):.1f}",
+            f"{float(orbit.get('apoapsis_km', 0) or 0):.1f}",
+            f"{float(orbit.get('inclination_deg', 0) or 0):.2f}",
+            f"{float(orbit.get('period_s', 0) or 0):.0f}",
+            f"{float(orbit.get('eccentricity', 0) or 0):.4f}",
         ]
         return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _orbit_similarity_score(left: dict, right: dict) -> float:
+        peri_left = float((left.get("orbit") or {}).get("periapsis_km", 0) or 0)
+        peri_right = float((right.get("orbit") or {}).get("periapsis_km", 0) or 0)
+        apo_left = float((left.get("orbit") or {}).get("apoapsis_km", 0) or 0)
+        apo_right = float((right.get("orbit") or {}).get("apoapsis_km", 0) or 0)
+        inc_left = float((left.get("orbit") or {}).get("inclination_deg", 0) or 0)
+        inc_right = float((right.get("orbit") or {}).get("inclination_deg", 0) or 0)
+        period_left = float((left.get("orbit") or {}).get("period_s", 0) or 0)
+        period_right = float((right.get("orbit") or {}).get("period_s", 0) or 0)
+        ecc_left = float((left.get("orbit") or {}).get("eccentricity", 0) or 0)
+        ecc_right = float((right.get("orbit") or {}).get("eccentricity", 0) or 0)
+        return (
+            abs(peri_left - peri_right) / 2.0 +
+            abs(apo_left - apo_right) / 2.0 +
+            abs(inc_left - inc_right) * 4.0 +
+            abs(period_left - period_right) / 30.0 +
+            abs(ecc_left - ecc_right) * 100.0
+        )
+
+    def _find_matching_record(self, snapshot: dict, records_by_key: dict[str, dict], current_game_uid: str) -> dict | None:
+        key = str(snapshot["identity_key"])
+        record = records_by_key.get(key)
+        if record is not None:
+            return record
+
+        snapshot_name = _normalize_key(snapshot.get("name", ""))
+        if not snapshot_name:
+            return None
+
+        candidates: list[tuple[float, dict]] = []
+        for candidate in self.records:
+            if str(candidate.get("game_uid") or current_game_uid) != current_game_uid:
+                continue
+            if _normalize_key(candidate.get("name", "")) != snapshot_name:
+                continue
+            if str(candidate.get("status_mode") or "auto") == "manual":
+                continue
+            score = self._orbit_similarity_score(snapshot, candidate)
+            if score <= 6.0:
+                candidates.append((score, candidate))
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (item[0], -int(item[1].get("id", 0))))
+        return candidates[0][1]
+
+    def _deduplicate_auto_records(self, game_uid: str) -> bool:
+        changed = False
+        current_records = [record for record in self.records if str(record.get("game_uid") or game_uid) == game_uid]
+        kept: list[dict] = []
+        removed_ids: set[int] = set()
+
+        for record in current_records:
+            if int(record.get("id", 0)) in removed_ids:
+                continue
+            if str(record.get("status_mode") or "auto") == "manual":
+                kept.append(record)
+                continue
+
+            merged = False
+            for existing in kept:
+                if str(existing.get("status_mode") or "auto") == "manual":
+                    continue
+                if _normalize_key(existing.get("name", "")) != _normalize_key(record.get("name", "")):
+                    continue
+                if self._orbit_similarity_score(existing, record) > 4.0:
+                    continue
+                preferred = existing
+                if int(record.get("id", 0)) > int(existing.get("id", 0)):
+                    preferred = record
+                    removed_ids.add(int(existing.get("id", 0)))
+                    kept[kept.index(existing)] = record
+                else:
+                    removed_ids.add(int(record.get("id", 0)))
+                if preferred is record:
+                    preferred["status"] = preferred.get("status", SATELLITE_STATUS_ACTIVE)
+                merged = True
+                changed = True
+                break
+            if not merged:
+                kept.append(record)
+
+        if removed_ids:
+            self.records = [record for record in self.records if int(record.get("id", 0)) not in removed_ids]
+            changed = True
+        return changed
 
     def _groups_for_vessel_type(self, vessel_type_name: str) -> list[str]:
         key = str(vessel_type_name).strip().lower()
@@ -2751,6 +3116,8 @@ class SatelliteStore:
         if self.current_game_uid not in self.games:
             self.games[self.current_game_uid] = self._default_game_payload(self.current_game_uid, save_name="Legado")
         self.last_signature = str(self.games.get(self.current_game_uid, {}).get("signature", self.last_signature))
+        if self._deduplicate_auto_records(self.current_game_uid):
+            self.save()
 
     def save(self) -> None:
         _save_json_file(self.data_file, {
@@ -3053,7 +3420,7 @@ class SatelliteStore:
                 except Exception:
                     launch_ut = None
 
-            record = records_by_key.get(key)
+            record = self._find_matching_record(sat, records_by_key, current_game_uid)
             if record is None:
                 record = {
                     "id": self._allocate_id(),
@@ -3077,6 +3444,7 @@ class SatelliteStore:
                 records_by_key[key] = record
                 changed = True
             else:
+                previous_key = str(record.get("ksp_identity_key") or "")
                 if record.get("game_uid") != current_game_uid:
                     record["game_uid"] = current_game_uid
                     changed = True
@@ -3098,14 +3466,17 @@ class SatelliteStore:
             if record.get("orbit") != orbit_payload:
                 record["orbit"] = orbit_payload
                 changed = True
-            if record.get("groups_auto") != default_groups:
-                record["groups_auto"] = default_groups
-                changed = True
-            record["ksp_identity_key"] = key
-            self._sync_group_fields(record)
-            if record.get("status_mode") == "auto" and record.get("status") == SATELLITE_STATUS_OFFLINE:
-                record["status"] = SATELLITE_STATUS_ACTIVE
-                changed = True
+                if record.get("groups_auto") != default_groups:
+                    record["groups_auto"] = default_groups
+                    changed = True
+                record["ksp_identity_key"] = key
+                if previous_key and previous_key != key:
+                    records_by_key.pop(previous_key, None)
+                records_by_key[key] = record
+                self._sync_group_fields(record)
+                if record.get("status_mode") == "auto" and record.get("status") == SATELLITE_STATUS_OFFLINE:
+                    record["status"] = SATELLITE_STATUS_ACTIVE
+                    changed = True
             elif not record.get("status"):
                 record["status"] = SATELLITE_STATUS_ACTIVE
                 record["status_mode"] = "auto"
@@ -3123,6 +3494,8 @@ class SatelliteStore:
         game["last_seen"] = self._timestamp()
         self.current_game_uid = current_game_uid
         self.last_signature = current_signature
+        if self._deduplicate_auto_records(current_game_uid):
+            changed = True
         self._normalize_records()
         self.save()
         return changed
@@ -6164,7 +6537,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.auth = AuthManager()
         self.setWindowTitle(APP_NAME)
-        self.resize(1120, 720)
+        self.resize(1120, 800)
         self.setMinimumSize(800, 560)
 
         # Estado de la conexión KSP (establecida durante la pantalla de carga)
@@ -6443,31 +6816,51 @@ def build_stylesheet() -> str:
         background: #2585aa;
         border-color: #9ee4f5;
     }
-    QPushButton#moduleCard {
-        text-align: left;
-        background: rgba(15, 29, 43, 230);
-        color: #eef7fb;
-        border: 1px solid rgba(120, 162, 190, 90);
-        border-left: 4px solid #6fc4e9;
-        border-radius: 10px;
-        padding: 20px 22px;
-        font-size: 18px;
-        font-weight: 700;
+    QWidget#moduleCard,
+    QWidget#moduleCardDisabled {
+        background: rgba(10, 18, 28, 140);
+        border: 1px solid rgba(123, 168, 198, 70);
+        border-radius: 16px;
     }
-    QPushButton#moduleCard:hover {
-        background: rgba(24, 47, 66, 245);
-        border-color: rgba(150, 222, 241, 180);
+    QWidget#moduleCard {
+        border-color: rgba(129, 215, 244, 120);
     }
-    QPushButton#moduleCardDisabled {
-        text-align: left;
-        background: rgba(12, 22, 32, 180);
-        color: #6f8291;
-        border: 1px solid rgba(100, 126, 147, 55);
-        border-left: 4px solid #405466;
-        border-radius: 10px;
-        padding: 20px 22px;
+    QWidget#moduleCard:hover {
+        border-color: rgba(157, 231, 255, 190);
+        background: rgba(12, 22, 33, 170);
+    }
+    QWidget#moduleCardDisabled {
+        border-color: rgba(95, 121, 142, 60);
+        background: rgba(8, 14, 22, 120);
+    }
+    QWidget#moduleCardDisabled QLabel#moduleCardTitle,
+    QWidget#moduleCardDisabled QLabel#moduleCardSubtitle {
+        color: rgba(190, 205, 216, 160);
+    }
+    QWidget#moduleCardImagePanel {
+        background: #08111b;
+        border-top-left-radius: 16px;
+        border-top-right-radius: 16px;
+    }
+    QWidget#moduleCardTextPanel {
+        background: rgba(18, 22, 28, 170);
+        border-bottom-left-radius: 16px;
+        border-bottom-right-radius: 16px;
+        border-top: 1px solid rgba(120, 162, 190, 55);
+    }
+    QLabel#moduleCardTitle {
+        color: #f0f7fb;
         font-size: 18px;
-        font-weight: 700;
+        font-weight: 800;
+        letter-spacing: 0.2px;
+    }
+    QLabel#moduleCardSubtitle {
+        color: #9cb0bf;
+        font-size: 12px;
+        font-weight: 600;
+    }
+    QWidget#moduleCard:hover QLabel#moduleCardTitle {
+        color: #ffffff;
     }
     #stateChip {
         color: #aef4df;
