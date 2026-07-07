@@ -399,34 +399,44 @@ class ProgramacionScreen(QWidget):
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setMinimumSectionSize(80)
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setAlternatingRowColors(True)
-        self.table.setShowGrid(False)
+        self.table.setShowGrid(True)
         self.table.setStyleSheet("""
             QTableWidget {
                 background: transparent;
                 border: none;
-                gridline-color: rgba(126,164,196,30);
-                selection-background-color: rgba(29,111,145,80);
+                gridline-color: rgba(126, 164, 196, 45);
+                selection-background-color: rgba(29, 111, 145, 90);
             }
             QHeaderView::section {
-                background: rgba(9,20,32,180);
+                background: rgba(9, 20, 32, 200);
                 color: #9fc7dc;
                 border: none;
-                border-bottom: 1px solid rgba(126,164,196,60);
-                padding: 10px 14px;
+                border-right: 1px solid rgba(126, 164, 196, 55);
+                border-bottom: 2px solid rgba(100, 180, 220, 90);
+                padding: 10px 16px;
                 font-weight: 700;
                 font-size: 13px;
+                text-align: left;
+            }
+            QHeaderView::section:last {
+                border-right: none;
             }
             QTableWidget::item {
-                padding: 10px 14px;
-                border-bottom: 1px solid rgba(126,164,196,20);
+                padding: 0px 16px;
+                border: none;
                 color: #dce9f6;
             }
+            QTableWidget::item:selected {
+                background: rgba(29, 111, 145, 90);
+                color: #f3f8fc;
+            }
             QTableWidget::item:alternate {
-                background: rgba(13,28,43,80);
+                background: rgba(13, 28, 43, 100);
             }
         """)
         table_layout.addWidget(self.table)
@@ -462,6 +472,7 @@ class ProgramacionScreen(QWidget):
                 text = str(record.get(key, ""))
                 item = QTableWidgetItem(text)
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
                 self.table.setItem(row, col, item)
 
             # Actions cell
