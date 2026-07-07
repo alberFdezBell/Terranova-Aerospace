@@ -25,12 +25,14 @@ import uuid
 from pathlib import Path
 
 from PyQt6.QtCore import QPointF
+from PyQt6.QtCore import QPoint, QRectF, QEvent
+from PyQt6.QtCore import QByteArray, QBuffer
 from PyQt6.QtGui import QMouseEvent
 from PySide6.QtCore import QVariantAnimation
 
 from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, QRect, QSize, Qt, QTimer, QThread, pyqtSignal, pyqtProperty, QDate
 from PyQt6.QtCore import QUrl
-from PyQt6.QtGui import QAction, QColor, QDesktopServices, QIcon, QPainter, QPen, QPixmap, QPalette, QFont, QCursor, QVector3D, QFontMetrics, QBrush, QTextCursor
+from PyQt6.QtGui import QAction, QColor, QDesktopServices, QIcon, QPainter, QPen, QPixmap, QPalette, QFont, QCursor, QVector3D, QFontMetrics, QBrush, QTextCursor, QTextDocument
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -62,6 +64,7 @@ from PyQt6.QtWidgets import (
     QStackedWidget,
     QMenu,
     QToolButton,
+    QRubberBand,
     QVBoxLayout,
     QWidget,
 )
@@ -1019,6 +1022,83 @@ def _press_rewrite_attachment_refs(body_html: str, path_map: dict[str, str]) -> 
     return rewritten
 
 
+def _press_crop_rect_from_payload(payload: dict | None) -> QRectF | None:
+    if not isinstance(payload, dict):
+        return None
+    try:
+        x = float(payload.get("x", 0.0))
+        y = float(payload.get("y", 0.0))
+        w = float(payload.get("w", 0.0))
+        h = float(payload.get("h", 0.0))
+    except (TypeError, ValueError):
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    return QRectF(x, y, w, h)
+
+
+def _press_crop_payload_from_rect(rect: QRectF | None) -> dict[str, float]:
+    if rect is None or rect.width() <= 0 or rect.height() <= 0:
+        return {}
+    return {
+        "x": max(0.0, min(1.0, float(rect.x()))),
+        "y": max(0.0, min(1.0, float(rect.y()))),
+        "w": max(0.0, min(1.0, float(rect.width()))),
+        "h": max(0.0, min(1.0, float(rect.height()))),
+    }
+
+
+def _press_center_horizontal_crop(pixmap: QPixmap) -> QRectF | None:
+    if pixmap.isNull():
+        return None
+    source_w = float(max(1, pixmap.width()))
+    source_h = float(max(1, pixmap.height()))
+    target_aspect = 16.0 / 9.0
+    source_aspect = source_w / source_h
+    if source_aspect > target_aspect:
+        crop_h = 1.0
+        crop_w = target_aspect / source_aspect
+    else:
+        crop_w = 1.0
+        crop_h = source_aspect / target_aspect
+    crop_x = (1.0 - crop_w) / 2.0
+    crop_y = (1.0 - crop_h) / 2.0
+    return QRectF(crop_x, crop_y, crop_w, crop_h)
+
+
+def _press_crop_image(pixmap: QPixmap, crop: QRectF | None) -> QPixmap:
+    crop_rect = crop or _press_center_horizontal_crop(pixmap)
+    if pixmap.isNull() or crop_rect is None or crop_rect.isNull():
+        return pixmap
+    crop_rect = QRectF(
+        max(0.0, min(1.0, crop_rect.x())),
+        max(0.0, min(1.0, crop_rect.y())),
+        max(0.05, min(1.0, crop_rect.width())),
+        max(0.05, min(1.0, crop_rect.height())),
+    )
+    if crop_rect.x() + crop_rect.width() > 1.0:
+        crop_rect.setWidth(1.0 - crop_rect.x())
+    if crop_rect.y() + crop_rect.height() > 1.0:
+        crop_rect.setHeight(1.0 - crop_rect.y())
+    x = int(crop_rect.x() * pixmap.width())
+    y = int(crop_rect.y() * pixmap.height())
+    w = max(1, int(crop_rect.width() * pixmap.width()))
+    h = max(1, int(crop_rect.height() * pixmap.height()))
+    return pixmap.copy(x, y, w, h)
+
+
+def _press_pixmap_to_data_uri(pixmap: QPixmap) -> str:
+    if pixmap.isNull():
+        return ""
+    buffer = QByteArray()
+    byte_buffer = QBuffer(buffer)
+    byte_buffer.open(QBuffer.OpenModeFlag.WriteOnly)
+    pixmap.save(byte_buffer, "PNG")
+    byte_buffer.close()
+    encoded = base64.b64encode(bytes(buffer)).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
 def _press_relativize_path(path: Path) -> str:
     try:
         return str(path.resolve().relative_to(BASE_DIR))
@@ -1101,14 +1181,7 @@ class PressStore:
         return notes
 
     def _matches_query(self, note: dict, term: str) -> bool:
-        haystack = " ".join([
-            str(note.get("title", "")),
-            str(note.get("author", "")),
-            str(note.get("date", "")),
-            str(note.get("importance", "")),
-            _press_summary_from_text(str(note.get("body_html", ""))),
-            " ".join(str(a.get("label", "")) for a in list(note.get("attachments", []) or [])),
-        ])
+        haystack = str(note.get("title", ""))
         return term in _normalize_key(haystack)
 
     def _sort_key(self, note: dict) -> tuple:
@@ -1127,6 +1200,7 @@ class PressStore:
             legacy_blocks = list(note.get("blocks", []) or [])
             body_html = str(note.get("body_html", "")).strip()
             main_image = str(note.get("main_image", "")).strip()
+            main_image_crop = _press_crop_rect_from_payload(note.get("main_image_crop"))
             attachments = list(note.get("attachments", []) or [])
             if legacy_blocks and not body_html and not attachments:
                 body_html, attachments = _press_legacy_body_and_attachments(legacy_blocks)
@@ -1149,6 +1223,7 @@ class PressStore:
                 "importance": str(note.get("importance", "")).strip(),
                 "body_html": body_html,
                 "main_image": main_image,
+                "main_image_crop": _press_crop_payload_from_rect(main_image_crop),
                 "attachments": attachments,
                 "summary": summary,
                 "created_at": float(note.get("created_at") or time.time()),
@@ -1237,6 +1312,7 @@ class PressStore:
     def _iter_media_paths(self) -> set[Path]:
         paths: set[Path] = set()
         for note in self.notes:
+            self._collect_media_path(paths, str(note.get("main_image", "")))
             for attachment in list(note.get("attachments", []) or []):
                 self._collect_media_path(paths, str(attachment.get("path", "")))
             for block in list(note.get("blocks", []) or []):
@@ -1291,6 +1367,350 @@ class PressTextEdit(QTextEdit):
                 self.reference_requested.emit()
         except Exception:
             pass
+
+
+class PressImageCropWidget(QWidget):
+    cropChanged = pyqtSignal()
+    HANDLE_SIZE = 12
+
+    def __init__(self, pixmap: QPixmap, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._source = pixmap
+        self._selection = QRectF()
+        self._zoom = 1.0
+        self._dragging = False
+        self._drag_mode = "move"
+        self._active_handle = ""
+        self._drag_offset = QPointF()
+        self._display_rect = QRectF()
+        self.setMouseTracking(True)
+        self.setMinimumSize(640, 360)
+
+    def sizeHint(self) -> QSize:
+        return QSize(760, 428)
+
+    def set_pixmap(self, pixmap: QPixmap) -> None:
+        self._source = pixmap
+        self._selection = QRectF()
+        self._zoom = 1.0
+        self.update()
+
+    def zoom(self) -> float:
+        return self._zoom
+
+    def set_zoom(self, value: float) -> None:
+        value = max(0.5, min(2.5, float(value)))
+        if abs(self._zoom - value) < 0.0001:
+            return
+        self._zoom = value
+        if self._selection.isNull():
+            self._selection = self._default_selection()
+        self.cropChanged.emit()
+        self.update()
+
+    def zoom_in(self) -> None:
+        self.set_zoom(self._zoom * 1.15)
+
+    def zoom_out(self) -> None:
+        self.set_zoom(self._zoom / 1.15)
+
+    def wheelEvent(self, event) -> None:
+        delta = event.angleDelta().y()
+        if delta > 0:
+            self.zoom_in()
+        elif delta < 0:
+            self.zoom_out()
+        event.accept()
+
+    def selection(self) -> QRectF | None:
+        return self._normalized_selection() if not self._selection.isNull() else None
+
+    def _image_rect(self) -> QRectF:
+        if self._source.isNull():
+            return QRectF()
+        scaled = self._source.size().scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
+        scaled = QSize(max(1, int(scaled.width() * self._zoom)), max(1, int(scaled.height() * self._zoom)))
+        x = (self.width() - scaled.width()) / 2.0
+        y = (self.height() - scaled.height()) / 2.0
+        return QRectF(x, y, scaled.width(), scaled.height())
+
+    def _selection_aspect(self) -> float:
+        return 16.0 / 9.0
+
+    def _default_selection(self) -> QRectF:
+        image_rect = self._image_rect()
+        if image_rect.isNull():
+            return QRectF()
+        width = image_rect.width() * 0.62
+        height = width / self._selection_aspect()
+        if height > image_rect.height():
+            height = image_rect.height() * 0.62
+            width = height * self._selection_aspect()
+        x = image_rect.center().x() - width / 2.0
+        y = image_rect.center().y() - height / 2.0
+        return self._clamp_selection(QRectF(x, y, width, height))
+
+    def _clamp_selection(self, rect: QRectF) -> QRectF:
+        image_rect = self._image_rect()
+        if image_rect.isNull():
+            return QRectF()
+        width = min(rect.width(), image_rect.width())
+        height = width / self._selection_aspect()
+        if height > image_rect.height():
+            height = image_rect.height()
+            width = height * self._selection_aspect()
+        x = max(image_rect.left(), min(rect.left(), image_rect.right() - width))
+        y = max(image_rect.top(), min(rect.top(), image_rect.bottom() - height))
+        return QRectF(x, y, width, height)
+
+    def _handle_rects(self) -> dict[str, QRectF]:
+        if self._selection.isNull():
+            return {}
+        size = float(self.HANDLE_SIZE)
+        half = size / 2.0
+        return {
+            "tl": QRectF(self._selection.left() - half, self._selection.top() - half, size, size),
+            "tr": QRectF(self._selection.right() - half, self._selection.top() - half, size, size),
+            "bl": QRectF(self._selection.left() - half, self._selection.bottom() - half, size, size),
+            "br": QRectF(self._selection.right() - half, self._selection.bottom() - half, size, size),
+        }
+
+    def _handle_at_point(self, pos: QPointF) -> str:
+        for name, rect in self._handle_rects().items():
+            if rect.contains(pos):
+                return name
+        return ""
+
+    def _selection_from_corner(self, handle: str, pos: QPointF) -> QRectF:
+        image_rect = self._image_rect()
+        if image_rect.isNull():
+            return QRectF()
+        pos = QPointF(
+            max(image_rect.left(), min(pos.x(), image_rect.right())),
+            max(image_rect.top(), min(pos.y(), image_rect.bottom())),
+        )
+        if handle == "tl":
+            anchor = self._selection.bottomRight()
+            width = max(20.0, anchor.x() - pos.x())
+            height = width / self._selection_aspect()
+            if anchor.y() - height < image_rect.top():
+                height = max(20.0, anchor.y() - image_rect.top())
+                width = height * self._selection_aspect()
+            x = anchor.x() - width
+            y = anchor.y() - height
+        elif handle == "tr":
+            anchor = self._selection.bottomLeft()
+            width = max(20.0, pos.x() - anchor.x())
+            height = width / self._selection_aspect()
+            if anchor.y() - height < image_rect.top():
+                height = max(20.0, anchor.y() - image_rect.top())
+                width = height * self._selection_aspect()
+            x = anchor.x()
+            y = anchor.y() - height
+        elif handle == "bl":
+            anchor = self._selection.topRight()
+            width = max(20.0, anchor.x() - pos.x())
+            height = width / self._selection_aspect()
+            if anchor.y() + height > image_rect.bottom():
+                height = max(20.0, image_rect.bottom() - anchor.y())
+                width = height * self._selection_aspect()
+            x = anchor.x() - width
+            y = anchor.y()
+        else:  # br
+            anchor = self._selection.topLeft()
+            width = max(20.0, pos.x() - anchor.x())
+            height = width / self._selection_aspect()
+            if anchor.y() + height > image_rect.bottom():
+                height = max(20.0, image_rect.bottom() - anchor.y())
+                width = height * self._selection_aspect()
+            x = anchor.x()
+            y = anchor.y()
+        return self._clamp_selection(QRectF(x, y, width, height))
+
+    def _normalized_selection(self) -> QRectF:
+        if self._selection.isNull():
+            return QRectF()
+        image_rect = self._image_rect()
+        if image_rect.isNull():
+            return QRectF()
+        left = (self._selection.left() - image_rect.left()) / image_rect.width()
+        top = (self._selection.top() - image_rect.top()) / image_rect.height()
+        width = self._selection.width() / image_rect.width()
+        height = self._selection.height() / image_rect.height()
+        return QRectF(left, top, width, height)
+
+    def set_normalized_selection(self, rect: QRectF | None) -> None:
+        image_rect = self._image_rect()
+        if image_rect.isNull() or rect is None or rect.isNull():
+            self._selection = self._default_selection()
+        else:
+            self._selection = self._clamp_selection(
+                QRectF(
+                    image_rect.left() + rect.x() * image_rect.width(),
+                    image_rect.top() + rect.y() * image_rect.height(),
+                    rect.width() * image_rect.width(),
+                    rect.height() * image_rect.height(),
+                )
+            )
+        self.update()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._selection.isNull():
+            self._selection = self._default_selection()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.fillRect(self.rect(), QColor(7, 16, 25))
+
+        image_rect = self._image_rect()
+        self._display_rect = image_rect
+        if self._source.isNull() or image_rect.isNull():
+            painter.setPen(QColor("#8fa4b8"))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Selecciona una imagen para recortarla")
+            return
+
+        scaled = self._source.scaled(
+            image_rect.size().toSize(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        painter.drawPixmap(int(image_rect.x()), int(image_rect.y()), scaled)
+
+        if self._selection.isNull():
+            self._selection = self._default_selection()
+        sel = self._selection
+        painter.fillRect(image_rect, QColor(0, 0, 0, 80))
+        painter.fillRect(sel, QColor(0, 0, 0, 0))
+        painter.setPen(QPen(QColor("#4da3ff"), 2))
+        painter.drawRect(sel)
+        painter.setBrush(QColor("#4da3ff"))
+        painter.setPen(Qt.PenStyle.NoPen)
+        for rect in self._handle_rects().values():
+            painter.drawRoundedRect(rect, 2, 2)
+
+    def mousePressEvent(self, event) -> None:
+        if self._source.isNull() or not self._display_rect.contains(event.position()):
+            return
+        handle = self._handle_at_point(event.position())
+        if handle:
+            self._dragging = True
+            self._drag_mode = "corner"
+            self._active_handle = handle
+        elif self._selection.contains(event.position()):
+            self._dragging = True
+            self._drag_mode = "move"
+            self._drag_offset = event.position() - self._selection.topLeft()
+        else:
+            width = self._display_rect.width() * 0.62
+            height = width / self._selection_aspect()
+            self._selection = self._clamp_selection(QRectF(event.position().x() - width / 2, event.position().y() - height / 2, width, height))
+            self._dragging = True
+            self._drag_mode = "move"
+            self._active_handle = ""
+            self._drag_offset = event.position() - self._selection.topLeft()
+            self.cropChanged.emit()
+            self.update()
+        event.accept()
+
+    def mouseMoveEvent(self, event) -> None:
+        if not self._dragging:
+            return
+        if self._drag_mode == "corner" and self._active_handle:
+            self._selection = self._selection_from_corner(self._active_handle, event.position())
+        else:
+            new_top_left = event.position() - self._drag_offset
+            self._selection = self._clamp_selection(QRectF(new_top_left, self._selection.size()))
+        self.cropChanged.emit()
+        self.update()
+        event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:
+        self._dragging = False
+        self._drag_mode = "move"
+        self._active_handle = ""
+        super().mouseReleaseEvent(event)
+
+
+class PressImageCropDialog(QDialog):
+    def __init__(self, image_path: str, crop: QRectF | None = None, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("Seleccionar imagen principal")
+        self.setModal(True)
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+        self.setStyleSheet("QDialog { background: #07111d; }")
+        self.resize(920, 620)
+        self._source_path = str(image_path)
+        self._result_crop: QRectF | None = crop
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(14, 14, 14, 14)
+        panel = GlassPanel()
+        panel.setObjectName("modalPanel")
+        panel.setStyleSheet("""
+            QFrame#modalPanel {
+                background: #101d2c;
+                border: 1px solid rgba(126, 164, 196, 90);
+                border-radius: 14px;
+            }
+        """)
+        outer.addWidget(panel)
+
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(18, 16, 18, 18)
+        panel_layout.setSpacing(12)
+
+        header = QHBoxLayout()
+        title = QLabel("Imagen principal")
+        title.setObjectName("title")
+        header.addWidget(title)
+        header.addStretch()
+        close_btn = QPushButton("Cerrar")
+        close_btn.clicked.connect(self.reject)
+        header.addWidget(close_btn)
+        panel_layout.addLayout(header)
+
+        info = QLabel("Arrastra el rectángulo para elegir el área visible. La imagen se mostrará siempre en horizontal.")
+        info.setObjectName("muted")
+        info.setWordWrap(True)
+        panel_layout.addWidget(info)
+
+        self.crop_widget = PressImageCropWidget(QPixmap(str(_resolve_press_path(self._source_path))))
+        panel_layout.addWidget(self.crop_widget, 1)
+        if crop is not None:
+            self.crop_widget.set_normalized_selection(crop)
+
+        zoom_row = QHBoxLayout()
+        zoom_row.addWidget(QLabel("Zoom"))
+        zoom_out_btn = QPushButton("−")
+        zoom_out_btn.setFixedWidth(40)
+        zoom_out_btn.clicked.connect(self.crop_widget.zoom_out)
+        zoom_in_btn = QPushButton("+")
+        zoom_in_btn.setFixedWidth(40)
+        zoom_in_btn.clicked.connect(self.crop_widget.zoom_in)
+        reset_zoom_btn = QPushButton("Restablecer")
+        reset_zoom_btn.clicked.connect(lambda: self.crop_widget.set_zoom(1.0))
+        zoom_row.addWidget(zoom_out_btn)
+        zoom_row.addWidget(zoom_in_btn)
+        zoom_row.addWidget(reset_zoom_btn)
+        zoom_row.addStretch()
+        panel_layout.addLayout(zoom_row)
+
+        footer = QHBoxLayout()
+        footer.addStretch()
+        cancel_btn = QPushButton("Cancelar")
+        cancel_btn.clicked.connect(self.reject)
+        ok_btn = QPushButton("Usar recorte")
+        ok_btn.setObjectName("primaryButton")
+        ok_btn.clicked.connect(self.accept)
+        footer.addWidget(cancel_btn)
+        footer.addWidget(ok_btn)
+        panel_layout.addLayout(footer)
+
+    def result_crop(self) -> QRectF | None:
+        return self.crop_widget.selection()
 
 
 class PressTextBlockWidget(QFrame):
@@ -1836,14 +2256,28 @@ class PressEditorDialog(QWidget):
         )
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
-        self.resize(920, 780)
+        
+        # 1. AJUSTE DE TAMAÑO: Reducimos el ancho y limitamos el alto para que quepa en cualquier monitor.
+        self.resize(950, 700) 
         self.setStyleSheet("QWidget { background: #07111d; }")
+        
+        # --- CÓDIGO PARA CENTRAR LA VENTANA EN LA PANTALLA ---
+        screen = self.screen() if self.screen() else QApplication.primaryScreen()
+        if screen:
+            screen_geo = screen.availableGeometry()
+            # Calculamos la posición X e Y del centro
+            x = screen_geo.x() + (screen_geo.width() - self.width()) // 2
+            y = screen_geo.y() + (screen_geo.height() - self.height()) // 2
+            self.move(x, y)
+        # -----------------------------------------------------
+
         self.store = store
         self.note = dict(note or {})
         self.note_id = int(self.note.get("id", 0) or 0)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(14, 14, 14, 14)
+        
         self.panel = GlassPanel()
         self.panel.setObjectName("modalPanel")
         self.panel.setStyleSheet("""
@@ -1872,9 +2306,24 @@ class PressEditorDialog(QWidget):
         header.addWidget(close_button)
         panel_layout.addLayout(header)
 
+        # 2. IMPLEMENTACIÓN DEL SCROLL AREA PARA EVITAR QUE CREZCA HACIA ABAJO
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("background: transparent; border: none;")
+        
+        # Contenedor interno que llevará todos los campos del formulario
+        scroll_content = QWidget()
+        scroll_content.setStyleSheet("background: transparent;")
+        form_layout = QVBoxLayout(scroll_content)
+        form_layout.setContentsMargins(0, 0, 4, 0) # Un pequeño margen derecho para el scrollbar
+        form_layout.setSpacing(14)
+
+        # --- A partir de aquí, añadimos los elementos a 'form_layout' en lugar de 'panel_layout' ---
+
         body_header = QLabel("Redacción de la nota")
         body_header.setObjectName("status")
-        panel_layout.addWidget(body_header)
+        form_layout.addWidget(body_header)
 
         grid = QGridLayout()
         grid.setHorizontalSpacing(12)
@@ -1897,9 +2346,10 @@ class PressEditorDialog(QWidget):
         grid.addWidget(self.date_edit, 1, 1)
         grid.addWidget(QLabel("Importancia"), 1, 2)
         grid.addWidget(self.importance_edit, 1, 3)
-        panel_layout.addLayout(grid)
+        form_layout.addLayout(grid)
 
         self.main_image_path = str(self.note.get("main_image", "")).strip()
+        self.main_image_crop = _press_crop_rect_from_payload(self.note.get("main_image_crop"))
         image_section = QHBoxLayout()
         image_section.setSpacing(12)
         image_box = QVBoxLayout()
@@ -1908,7 +2358,8 @@ class PressEditorDialog(QWidget):
         image_label.setObjectName("status")
         image_box.addWidget(image_label)
         self.main_image_preview = QLabel()
-        self.main_image_preview.setMinimumHeight(150)
+        self.main_image_preview.setMinimumSize(QSize(380, 214))
+        self.main_image_preview.setMaximumHeight(240)
         self.main_image_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.main_image_preview.setWordWrap(True)
         self.main_image_preview.setStyleSheet(
@@ -1925,31 +2376,31 @@ class PressEditorDialog(QWidget):
         image_btns.addStretch()
         image_box.addLayout(image_btns)
         image_section.addLayout(image_box, 1)
-        panel_layout.addLayout(image_section)
+        form_layout.addLayout(image_section)
         self._refresh_main_image_preview()
 
         self.editor = PressTextEdit()
         self.editor.setPlaceholderText("Escribe aquí la nota de prensa...")
         self.editor.setAcceptRichText(True)
-        self.editor.setMinimumHeight(300)
+        self.editor.setMinimumHeight(250) # Reducido ligeramente de 300 a 250 para optimizar espacio
         self.editor.reference_requested.connect(lambda: self._show_reference_menu(True))
         legacy_body = str(self.note.get("body_html", "")).strip()
         if not legacy_body and self.note.get("blocks"):
             legacy_body, _ = _press_legacy_body_and_attachments(list(self.note.get("blocks", []) or []))
         if legacy_body:
             self.editor.setHtml(legacy_body)
-        panel_layout.addWidget(self.editor, 1)
+        form_layout.addWidget(self.editor)
 
         attachments_title = QLabel("Adjuntos al final")
         attachments_title.setObjectName("status")
-        panel_layout.addWidget(attachments_title)
+        form_layout.addWidget(attachments_title)
 
         self.attachments = QListWidget()
-        self.attachments.setMinimumHeight(150)
+        self.attachments.setMinimumHeight(120) # Reducido de 150 a 120
         self.attachments.setAlternatingRowColors(True)
         self.attachments.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
         self._load_attachments()
-        panel_layout.addWidget(self.attachments)
+        form_layout.addWidget(self.attachments)
 
         attachment_buttons = QHBoxLayout()
         add_attachment_btn = QPushButton("Añadir archivos")
@@ -1962,8 +2413,13 @@ class PressEditorDialog(QWidget):
         attachment_buttons.addWidget(remove_attachment_btn)
         attachment_buttons.addWidget(reference_btn)
         attachment_buttons.addStretch()
-        panel_layout.addLayout(attachment_buttons)
+        form_layout.addLayout(attachment_buttons)
 
+        # Asignamos el contenedor al scroll area, y añadimos el scroll area al panel principal
+        scroll.setWidget(scroll_content)
+        panel_layout.addWidget(scroll, 1)
+
+        # El footer (cancelar/guardar) se queda fuera del scroll para que siempre esté visible abajo fijado
         footer = QHBoxLayout()
         footer.addStretch()
         cancel_btn = QPushButton("Cancelar")
@@ -2020,11 +2476,12 @@ class PressEditorDialog(QWidget):
             self.main_image_preview.setPixmap(QPixmap())
             self.main_image_preview.setText("No se pudo cargar la imagen principal.")
             return
+        pix = self._crop_main_image_pixmap(pix)
         self.main_image_preview.setText("")
         self.main_image_preview.setPixmap(
             pix.scaled(
-                self.main_image_preview.size().expandedTo(QSize(640, 240)),
-                Qt.AspectRatioMode.KeepAspectRatio,
+                self.main_image_preview.size().expandedTo(QSize(380, 214)),
+                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
                 Qt.TransformationMode.SmoothTransformation,
             )
         )
@@ -2039,11 +2496,16 @@ class PressEditorDialog(QWidget):
         if not file_name:
             return
         self.main_image_path = str(Path(file_name))
+        self.main_image_crop = None
         self._refresh_main_image_preview()
 
     def _clear_main_image(self) -> None:
         self.main_image_path = ""
+        self.main_image_crop = None
         self._refresh_main_image_preview()
+
+    def _crop_main_image_pixmap(self, pixmap: QPixmap) -> QPixmap:
+        return pixmap
 
     def _insert_attachment_reference(self, attachment: dict, replace_at: bool = False) -> None:
         path = str(attachment.get("path", "")).strip()
@@ -2128,6 +2590,7 @@ class PressEditorDialog(QWidget):
             "importance": self.importance_edit.text().strip(),
             "body_html": self.editor.toHtml().strip(),
             "main_image": self.main_image_path.strip(),
+            "main_image_crop": _press_crop_payload_from_rect(self.main_image_crop),
             "attachments": attachments,
         }
 
@@ -2157,10 +2620,18 @@ class PressNoteCard(QFrame):
         self._build_ui()
 
     def _build_ui(self) -> None:
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 16, 18, 16)
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(18, 16, 18, 16)
+        outer.setSpacing(0)
+
+        # Contenedor izquierdo: Contenido de texto
+        text_widget = QWidget()
+        text_widget.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        layout = QVBoxLayout(text_widget)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(9)
 
+        # 1. TÍTULO
         top = QHBoxLayout()
         top.setContentsMargins(0, 0, 0, 0)
         top.setSpacing(10)
@@ -2171,12 +2642,7 @@ class PressNoteCard(QFrame):
         top.addWidget(self.title_label, 1)
         layout.addLayout(top)
 
-        meta = QLabel(self._meta_text())
-        meta.setObjectName("muted")
-        meta.setWordWrap(True)
-        meta.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        layout.addWidget(meta)
-
+        # 2. IMPORTANCIA (Se muestra debajo del título si existe)
         importance = str(self.note.get("importance", "")).strip()
         if importance:
             chip = QLabel(importance)
@@ -2184,6 +2650,7 @@ class PressNoteCard(QFrame):
             chip.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
             layout.addWidget(chip, alignment=Qt.AlignmentFlag.AlignLeft)
 
+        # 3. CUERPO / RESUMEN DE LA NOTA
         summary = QLabel(self._summary_text())
         summary.setWordWrap(True)
         summary.setObjectName("muted")
@@ -2191,6 +2658,48 @@ class PressNoteCard(QFrame):
         summary.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
         summary.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         layout.addWidget(summary)
+
+        # 4. AUTOR Y FECHA (Ubicados ahora debajo del texto)
+        meta = QLabel(self._meta_text())
+        meta.setObjectName("muted")
+        meta.setWordWrap(True)
+        meta.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        layout.addWidget(meta)
+
+        outer.addWidget(text_widget, 1)
+
+        # Contenedor derecho: Miniatura de la imagen si existe
+        main_image = str(self.note.get("main_image", "")).strip()
+        if main_image:
+            resolved = _resolve_press_path(main_image)
+            if resolved.exists():
+                pix = QPixmap(str(resolved))
+                if not pix.isNull():
+                    THUMB_H = 72
+                    aspect = pix.width() / max(1, pix.height())
+                    thumb_w = max(48, int(THUMB_H * aspect))
+                    thumb_w = min(thumb_w, 120)
+                    thumb = pix.scaled(
+                        thumb_w, THUMB_H,
+                        Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                    # Recorte centrado al tamaño exacto
+                    if thumb.width() > thumb_w or thumb.height() > THUMB_H:
+                        x_off = (thumb.width() - thumb_w) // 2
+                        y_off = (thumb.height() - THUMB_H) // 2
+                        thumb = thumb.copy(x_off, y_off, thumb_w, THUMB_H)
+                    
+                    thumb_label = QLabel()
+                    thumb_label.setPixmap(thumb)
+                    thumb_label.setFixedSize(thumb_w, THUMB_H)
+                    thumb_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+                    thumb_label.setStyleSheet(
+                        "QLabel { border-radius: 8px; background: rgba(0,0,0,0); }"
+                    )
+                    thumb_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                    outer.addSpacing(14)
+                    outer.addWidget(thumb_label, 0, Qt.AlignmentFlag.AlignVCenter)
 
     def _meta_text(self) -> str:
         author = str(self.note.get("author", "")).strip() or "Sin autor"
@@ -2201,6 +2710,18 @@ class PressNoteCard(QFrame):
         except Exception:
             date_label = str(date)
         return f"{author} · {date_label}"
+
+    def _summary_text(self) -> str:
+        blocks = list(self.note.get("blocks", []) or [])
+        if blocks:
+            return _press_summary_from_blocks(blocks)
+        body_html = str(self.note.get("body_html", "")).strip()
+        summary = str(self.note.get("summary", "")).strip()
+        if summary:
+            return _press_plain_text_from_html(summary)
+        if body_html:
+            return _press_summary_from_text(body_html)
+        return "Sin resumen disponible."
 
     def _set_hovered(self, active: bool) -> None:
         if self._hovered == active:
@@ -2219,53 +2740,75 @@ class PressNoteCard(QFrame):
         super().leaveEvent(event)
         self._set_hovered(False)
 
-    def _summary_text(self) -> str:
-        blocks = list(self.note.get("blocks", []) or [])
-        if blocks:
-            return _press_summary_from_blocks(blocks)
-        body_html = str(self.note.get("body_html", "")).strip()
-        summary = str(self.note.get("summary", "")).strip()
-        if summary:
-            return _press_plain_text_from_html(summary)
-        if body_html:
-            return _press_summary_from_text(body_html)
-        return "Sin resumen disponible."
-
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             self.on_open(self.note)
         super().mousePressEvent(event)
 
-    def enterEvent(self, event) -> None:
-        super().enterEvent(event)
-        self._set_hovered(True)
-
-    def leaveEvent(self, event) -> None:
-        super().leaveEvent(event)
-        self._set_hovered(False)
-
 
 class PressImageViewer(QFrame):
-    def __init__(self, path: str, caption: str = "", parent: QWidget | None = None):
+    def __init__(self, path: str, caption: str = "", crop: QRectF | None = None, max_width: int = 380, parent: QWidget | None = None):
         super().__init__(parent)
         self.setObjectName("pressBlock")
+        self._crop = crop
+        self._max_width = max_width
+        self._zoom = 1.0
+        self._base_pixmap = QPixmap(str(_resolve_press_path(path)))
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(8)
-        image = QLabel()
-        image.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        image.setWordWrap(True)
-        pix = QPixmap(str(_resolve_press_path(path)))
-        if pix.isNull():
-            image.setText("No se pudo cargar la imagen.")
-        else:
-            image.setPixmap(pix.scaledToWidth(760, Qt.TransformationMode.SmoothTransformation))
-        layout.addWidget(image)
+        self.image = QLabel()
+        self.image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image.setWordWrap(True)
+        self.image.setMinimumHeight(180)
+        self.image.setMouseTracking(True)
+        self.image.setStyleSheet("QLabel { background: rgba(7, 16, 25, 80); border-radius: 10px; }")
+        self.image.installEventFilter(self)
+        self._update_pixmap()
+        layout.addWidget(self.image)
         if caption:
             cap = QLabel(caption)
             cap.setObjectName("muted")
             cap.setWordWrap(True)
             layout.addWidget(cap)
+
+    def _apply_crop(self, pixmap: QPixmap) -> QPixmap:
+        return _press_crop_image(pixmap, self._crop)
+
+    def _update_pixmap(self) -> None:
+        if self._base_pixmap.isNull():
+            self.image.setPixmap(QPixmap())
+            self.image.setText("No se pudo cargar la imagen.")
+            return
+        pix = self._apply_crop(self._base_pixmap)
+        target_width = max(220, int(self._max_width * self._zoom))
+        self.image.setText("")
+        self.image.setPixmap(
+            pix.scaledToWidth(target_width, Qt.TransformationMode.SmoothTransformation)
+        )
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._update_pixmap()
+
+    def wheelEvent(self, event) -> None:
+        delta = event.angleDelta().y()
+        if delta > 0:
+            self._zoom = min(2.5, self._zoom * 1.12)
+            self._update_pixmap()
+            event.accept()
+        elif delta < 0:
+            self._zoom = max(0.5, self._zoom / 1.12)
+            self._update_pixmap()
+            event.accept()
+        else:
+            super().wheelEvent(event)
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is self.image and event.type() == QEvent.Type.Wheel:
+            self.wheelEvent(event)
+            return True
+        return super().eventFilter(obj, event)
 
 
 class PressCarouselViewer(QFrame):
@@ -2597,9 +3140,49 @@ class PressReaderScreen(QWidget):
         self.title_label.setText(str(note.get("title", "")) or "Sin título")
         self._clear_content()
 
+        body = QTextBrowser()
+        body.setOpenExternalLinks(False)
+        body.setOpenLinks(False)
+        body.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        body.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        body.setStyleSheet(
+            "QTextBrowser { background: transparent; border: none; color: #dce9f6; }"
+            "QTextBrowser a { color: #4da3ff; text-decoration: none; }"
+            "QTextBrowser a:hover { text-decoration: underline; }"
+        )
+        body.document().documentLayout().documentSizeChanged.connect(
+            lambda *args: body.setFixedHeight(int(body.document().size().height()) + 15)
+        )
+
         main_image = str(note.get("main_image", "")).strip()
+        main_image_html = ""
         if main_image:
-            self.content_layout.addWidget(PressImageViewer(main_image, ""))
+            resolved = _resolve_press_path(main_image)
+            if resolved.exists():
+                pix = QPixmap(str(resolved))
+                if not pix.isNull():
+                    w = pix.width() // 2
+                    h = pix.height() // 2
+                    max_w = 420
+                    if w > max_w:
+                        scale = max_w / w
+                        w = max_w
+                        h = max(1, int(h * scale))
+                    
+                    # Create padded pixmap to act as margins: right = 28px, bottom = 20px
+                    margin_right = 28
+                    margin_bottom = 20
+                    padded_pix = QPixmap(w + margin_right, h + margin_bottom)
+                    padded_pix.fill(QColor(0, 0, 0, 0))
+                    
+                    scaled_pix = pix.scaled(w, h, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                    painter = QPainter(padded_pix)
+                    painter.drawPixmap(0, 0, scaled_pix)
+                    painter.end()
+                    
+                    img_ref = f"main_image_{self.current_note_id}"
+                    body.document().addResource(QTextDocument.ResourceType.ImageResource, QUrl(img_ref), padded_pix)
+                    main_image_html = f'<img src="{img_ref}" align="left" width="{w + margin_right}" height="{h + margin_bottom}">'
 
         importance = str(note.get("importance", "")).strip()
         if importance:
@@ -2609,16 +3192,9 @@ class PressReaderScreen(QWidget):
         body_html = str(note.get("body_html", "")).strip()
         if not body_html and note.get("blocks"):
             body_html, _ = _press_legacy_body_and_attachments(list(note.get("blocks", []) or []))
-        body = QTextBrowser()
-        body.setOpenExternalLinks(False)
-        body.setOpenLinks(False)
-        body.setStyleSheet(
-            "QTextBrowser { background: transparent; border: none; color: #dce9f6; }"
-            "QTextBrowser a { color: #4da3ff; text-decoration: none; }"
-            "QTextBrowser a:hover { text-decoration: underline; }"
-        )
+        if main_image_html:
+            body_html = main_image_html + body_html
         body.setHtml(body_html or "<p>Sin contenido.</p>")
-        body.setMinimumHeight(280)
         body.anchorClicked.connect(lambda url, payload=note: self._open_body_anchor(payload, url))
         self.content_layout.addWidget(body)
 
@@ -2637,7 +3213,7 @@ class PressReaderScreen(QWidget):
             for attachment in attachments:
                 path = str(attachment.get("path", "")).strip()
                 label = str(attachment.get("label", "")) or Path(path).stem or "Adjunto"
-                file_name = Path(path).name or label
+                file_name = Path(path).name if path else "Adjunto"
                 kind = str(attachment.get("type", "")).strip().lower()
                 icon = attachment_icons.get(kind, "📎")
                 btn = QPushButton(f"{icon}   {file_name}")
@@ -2800,7 +3376,7 @@ class PressListScreen(QWidget):
         panel_layout.addLayout(header)
 
         self.search = QLineEdit()
-        self.search.setPlaceholderText("Buscar por título, fecha o importancia")
+        self.search.setPlaceholderText("Buscar por título")
         self.search.setMaximumWidth(560)
         self.search.textChanged.connect(self._on_search_changed)
         search_row = QHBoxLayout()
@@ -2980,12 +3556,58 @@ class PressModuleScreen(QWidget):
             if note is not None:
                 self.reader.show_note(note)
 
+    # ------------------------------------------------------------------ #
+    # Transición suave entre pantallas                                     #
+    # ------------------------------------------------------------------ #
+    def _press_fade_to(self, target_widget: QWidget, post_switch=None) -> None:
+        """Realiza un fundido cruzado (fade-out → switch → fade-in) entre
+        la pantalla actual del stack y *target_widget*.
+        """
+        current = self.stack.currentWidget()
+        FADE_OUT_MS = 160
+        FADE_IN_MS  = 220
+
+        def _do_switch():
+            self.stack.setCurrentWidget(target_widget)
+            if post_switch:
+                post_switch()
+            # Fade-in del panel del widget entrante
+            panel = getattr(target_widget, "panel", target_widget)
+            effect = QGraphicsOpacityEffect(panel)
+            panel.setGraphicsEffect(effect)
+            anim = QPropertyAnimation(effect, b"opacity", panel)
+            anim.setDuration(FADE_IN_MS)
+            anim.setStartValue(0.0)
+            anim.setEndValue(1.0)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            panel._press_fade_anim_in = anim
+            anim.finished.connect(lambda: panel.setGraphicsEffect(None))
+            anim.start()
+
+        if current is target_widget:
+            _do_switch()
+            return
+
+        # Fade-out del panel saliente
+        panel_out = getattr(current, "panel", current)
+        effect_out = QGraphicsOpacityEffect(panel_out)
+        panel_out.setGraphicsEffect(effect_out)
+        anim_out = QPropertyAnimation(effect_out, b"opacity", panel_out)
+        anim_out.setDuration(FADE_OUT_MS)
+        anim_out.setStartValue(1.0)
+        anim_out.setEndValue(0.0)
+        anim_out.setEasingCurve(QEasingCurve.Type.InCubic)
+        panel_out._press_fade_anim_out = anim_out
+        anim_out.finished.connect(lambda: (panel_out.setGraphicsEffect(None), _do_switch()))
+        anim_out.start()
+
     def _show_list(self) -> None:
-        self.stack.setCurrentWidget(self.list_screen)
-        self.list_screen.refresh()
-        self.reader.title_label.setText("Notas de Prensa")
-        self._set_back_button_visible(True)
-        self._position_back_button()
+        def _after():
+            self.list_screen.refresh()
+            self.reader.title_label.setText("Notas de Prensa")
+            self._set_back_button_visible(True)
+            self._position_back_button()
+        self._press_fade_to(self.list_screen, _after)
 
     def _open_note(self, note: dict, edit_mode: bool = False, delete_mode: bool = False) -> None:
         note_id = int(note.get("id", 0) or 0)
@@ -3000,9 +3622,10 @@ class PressModuleScreen(QWidget):
             self._edit_note(current)
             return
         self.reader.show_note(current)
-        self.stack.setCurrentWidget(self.reader)
-        self._set_back_button_visible(False)
-        self._position_back_button()
+        def _after():
+            self._set_back_button_visible(False)
+            self._position_back_button()
+        self._press_fade_to(self.reader, _after)
 
     def _create_note(self) -> None:
         self._open_editor()
