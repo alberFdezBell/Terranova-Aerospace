@@ -1959,3 +1959,176 @@ class SatelliteStore:
                 self._sync_group_fields(record)
         self.save()
         return True
+
+
+# ─── Programación Store ───────────────────────────────────────────────────────
+
+PROGRAMACION_FILE = CONFIG_DIR / "programacion.json"
+
+MANIOBRA_TYPES = [
+    "Lanzamiento",
+    "Desorbitamiento",
+    "Acople",
+    "Modificación de órbita",
+]
+
+
+class ProgramacionStore:
+    """Persistence layer for scheduled manoeuvres/launches."""
+
+    def __init__(self, data_file: Path = PROGRAMACION_FILE):
+        self.data_file = data_file
+        self.records: list[dict] = []
+        self.next_id = 1
+        self.load()
+
+    def load(self) -> None:
+        payload = _load_json_file(self.data_file, {})
+        if isinstance(payload, dict):
+            self.next_id = int(payload.get("next_id", 1))
+            raw = payload.get("records", [])
+            self.records = [r for r in raw if isinstance(r, dict)]
+        else:
+            self.next_id = 1
+            self.records = []
+
+    def save(self) -> None:
+        _save_json_file(self.data_file, {
+            "next_id": self.next_id,
+            "records": self.records,
+        })
+
+    def _allocate_id(self) -> int:
+        rid = self.next_id
+        self.next_id += 1
+        return rid
+
+    def get_all(self) -> list[dict]:
+        return list(self.records)
+
+    def get_by_id(self, record_id: int) -> dict | None:
+        for r in self.records:
+            if int(r.get("id", 0)) == int(record_id):
+                return r
+        return None
+
+    def add(self, objeto: str, maniobra: str, detalles: str, fecha: str) -> dict:
+        record = {
+            "id": self._allocate_id(),
+            "objeto": str(objeto).strip(),
+            "maniobra": str(maniobra).strip(),
+            "detalles": str(detalles).strip(),
+            "fecha": str(fecha).strip(),
+            "created_at": time.time(),
+        }
+        self.records.append(record)
+        self.save()
+        return record
+
+    def update(self, record_id: int, objeto: str, maniobra: str, detalles: str, fecha: str) -> bool:
+        record = self.get_by_id(record_id)
+        if record is None:
+            return False
+        record["objeto"] = str(objeto).strip()
+        record["maniobra"] = str(maniobra).strip()
+        record["detalles"] = str(detalles).strip()
+        record["fecha"] = str(fecha).strip()
+        self.save()
+        return True
+
+    def delete(self, record_id: int) -> bool:
+        before = len(self.records)
+        self.records = [r for r in self.records if int(r.get("id", 0)) != int(record_id)]
+        if len(self.records) == before:
+            return False
+        self.save()
+        return True
+
+
+# ─── Personal Store ───────────────────────────────────────────────────────────
+
+PERSONAL_FILE = CONFIG_DIR / "personal.json"
+
+
+class PersonalStore:
+    """Persistence layer for staff/personnel management."""
+
+    def __init__(self, data_file: Path = PERSONAL_FILE):
+        self.data_file = data_file
+        self.records: list[dict] = []
+        self.next_id = 1
+        self.load()
+
+    def load(self) -> None:
+        payload = _load_json_file(self.data_file, {})
+        if isinstance(payload, dict):
+            self.next_id = int(payload.get("next_id", 1))
+            raw = payload.get("records", [])
+            self.records = [r for r in raw if isinstance(r, dict)]
+        else:
+            self.next_id = 1
+            self.records = []
+
+    def save(self) -> None:
+        _save_json_file(self.data_file, {
+            "next_id": self.next_id,
+            "records": self.records,
+        })
+
+    def _allocate_id(self) -> int:
+        rid = self.next_id
+        self.next_id += 1
+        return rid
+
+    def get_all(self) -> list[dict]:
+        return list(self.records)
+
+    def get_by_id(self, record_id: int) -> dict | None:
+        for r in self.records:
+            if int(r.get("id", 0)) == int(record_id):
+                return r
+        return None
+
+    def query(self, text: str = "") -> list[dict]:
+        term = _normalize_key(text)
+        results = list(self.records)
+        if term:
+            results = [
+                r for r in results
+                if term in _normalize_key(r.get("nombre", ""))
+                or term in _normalize_key(r.get("apellidos", ""))
+                or term in str(r.get("edad", ""))
+            ]
+        return results
+
+    def add(self, nombre: str, apellidos: str, edad: str, puesto: str) -> dict:
+        record = {
+            "id": self._allocate_id(),
+            "nombre": str(nombre).strip(),
+            "apellidos": str(apellidos).strip(),
+            "edad": str(edad).strip(),
+            "puesto": str(puesto).strip(),
+            "created_at": time.time(),
+        }
+        self.records.append(record)
+        self.save()
+        return record
+
+    def update(self, record_id: int, nombre: str, apellidos: str, edad: str, puesto: str) -> bool:
+        record = self.get_by_id(record_id)
+        if record is None:
+            return False
+        record["nombre"] = str(nombre).strip()
+        record["apellidos"] = str(apellidos).strip()
+        record["edad"] = str(edad).strip()
+        record["puesto"] = str(puesto).strip()
+        self.save()
+        return True
+
+    def delete(self, record_id: int) -> bool:
+        before = len(self.records)
+        self.records = [r for r in self.records if int(r.get("id", 0)) != int(record_id)]
+        if len(self.records) == before:
+            return False
+        self.save()
+        return True
