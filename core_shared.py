@@ -503,8 +503,8 @@ class ModuleCard(QWidget):
         self.setObjectName("moduleCard" if available else "moduleCardDisabled")
         self.setCursor(Qt.CursorShape.PointingHandCursor if available else Qt.CursorShape.ArrowCursor)
         
-        # 1. CAMBIO: Permitimos que crezca de forma libre tanto a lo ancho como a lo alto
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        # 1. TAMAÑO FIJO ABSOLUTO: Bloquea las dimensiones de la card a 330x330 px
+        self.setFixedSize(330, 330)
         
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
@@ -514,13 +514,15 @@ class ModuleCard(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # 2. CAMBIO: Quitamos los límites fijos mínimos y máximos a la imagen
+        # 2. DISTRIBUCIÓN INTERNA INTERNA FIJA (Ejemplo: 230px imagen + 100px texto = 330px total)
         self.image_panel = ModuleCardImagePanel(self._load_pixmap())
         self.image_panel.setObjectName("moduleCardImagePanel")
+        self.image_panel.setFixedHeight(230) 
         root.addWidget(self.image_panel)
 
         self.text_panel = QFrame()
         self.text_panel.setObjectName("moduleCardTextPanel")
+        self.text_panel.setFixedHeight(100)
         self.text_panel.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         text_layout = QVBoxLayout(self.text_panel)
         text_layout.setContentsMargins(18, 12, 18, 12)
@@ -540,18 +542,7 @@ class ModuleCard(QWidget):
         text_layout.addStretch()
         root.addWidget(self.text_panel)
 
-    # 3. NUEVO: Este método controla en tiempo real la geometría de la tarjeta al cambiar el tamaño
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        w = self.width()
-        if w > 0:
-            # Fuerza a la tarjeta completa a ser un cuadrado perfecto (Ancho = Alto)
-            self.setFixedHeight(w)
-            
-            # El panel de texto se queda con un tercio (33%) del tamaño aproximado,
-            # y el panel de la imagen absorbe el resto dinámicamente.
-            text_height = int(w * 0.33)
-            self.text_panel.setFixedHeight(text_height)
+    # Nota: Ya NO necesitas el método resizeEvent(), puedes borrarlo si lo habías añadido.
 
     def _subtitle_text(self) -> str:
         if self.available:

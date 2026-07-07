@@ -239,23 +239,40 @@ class CommandCenter(QWidget):
         header_layout.addWidget(self.save_context_card, alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
         content_layout.addWidget(header)
 
+        # === AQUÍ ESTÁ EL TRUCO PARA CENTRAR TODO EL BLOQUE ===
+        # Creamos un contenedor intermedio horizontal
+        centering_widget = QWidget()
+        centering_layout = QHBoxLayout(centering_widget)
+        centering_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # 1. Empuje izquierdo
+        centering_layout.addStretch(1)
+
         grid_container = QWidget()
         self.grid = QGridLayout(grid_container)
         self.grid.setHorizontalSpacing(18)
         self.grid.setVerticalSpacing(18)
         self.grid.setContentsMargins(0, 0, 0, 0)
+        
         self.module_cards: list[ModuleCard] = []
         for index, (name, target) in enumerate(MODULES.items()):
             card = ModuleCard(name, bool(target), MODULE_PANEL_IMAGES.get(name))
             card.clicked.connect(lambda module=name: self.on_module_selected(module))
             self.module_cards.append(card)
             row, col = divmod(index, 3)
-            self.grid.addWidget(card, row, col)
+            # Aseguramos que se añadan con alineación al centro por si acaso
+            self.grid.addWidget(card, row, col, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        self.grid.setColumnStretch(0, 1)
-        self.grid.setColumnStretch(1, 1)
-        self.grid.setColumnStretch(2, 1)
-        content_layout.addWidget(grid_container)
+        # Añadimos el contenedor del grid al layout centrado
+        centering_layout.addWidget(grid_container)
+        
+        # 2. Empuje derecho
+        centering_layout.addStretch(1)
+        
+        # Añadimos el bloque centrado al layout principal del contenido
+        content_layout.addWidget(centering_widget)
+        # ======================================================
+
         content_layout.addStretch()
 
         scroll.setWidget(content)
@@ -297,15 +314,18 @@ class CommandCenter(QWidget):
             return
         width = max(1, self.width())
         columns = 1 if width < 760 else 2 if width < 1080 else 3
+        
         while self.grid.count():
             item = self.grid.takeAt(0)
             if item and item.widget():
                 item.widget().setParent(None)
+                
         for index, card in enumerate(self.module_cards):
             row, col = divmod(index, columns)
-            self.grid.addWidget(card, row, col)
-        for col in range(columns):
-            self.grid.setColumnStretch(col, 1)
+            self.grid.addWidget(card, row, col, alignment=Qt.AlignmentFlag.AlignCenter)
+            
+        # Al quitar el loop que hacía self.grid.setColumnStretch(col, 1),
+        # las columnas ya no se separarán artificialmente.
 
 
 class ModuleTransitionScreen(QWidget):
@@ -834,7 +854,7 @@ def main() -> int:
     app.setStyleSheet(build_stylesheet())
 
     window = MainWindow()
-    window.show()
+    window.showMaximized()
     return app.exec()
 
 
