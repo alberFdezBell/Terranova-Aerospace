@@ -185,9 +185,10 @@ class StartupLoadingScreen(QWidget):
 
 
 class CommandCenter(QWidget):
-    def __init__(self, on_module_selected, parent: QWidget | None = None):
+    def __init__(self, on_module_selected, on_reload_clicked=None, parent: QWidget | None = None):
         super().__init__(parent)
         self.on_module_selected = on_module_selected
+        self.on_reload_clicked = on_reload_clicked
         self._active_save_context: dict | None = None
         self._build_ui()
         self._save_context_timer = QTimer(self)
@@ -218,6 +219,16 @@ class CommandCenter(QWidget):
 
         logo = LogoLabel(QSize(460, 170))
         header_layout.addWidget(logo, 1, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        # Botón de recarga
+        if self.on_reload_clicked:
+            reload_btn = QPushButton("↻ Recargar")
+            reload_btn.setObjectName("reloadButton")
+            reload_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            reload_btn.setFixedSize(110, 34)
+            reload_btn.clicked.connect(self.on_reload_clicked)
+            header_layout.addWidget(reload_btn, alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
         self.save_context_card = QFrame()
         self.save_context_card.setObjectName("saveContextCard")
         self.save_context_card.setFixedWidth(300)
@@ -388,7 +399,10 @@ class MainWindow(QMainWindow):
             on_finished=self.show_command_center,
             ksp_callbacks=(self._on_ksp_connected, self._on_ksp_failed),
         )
-        self.command = CommandCenter(self.prepare_module)
+        self.command = CommandCenter(
+            on_module_selected=self.prepare_module,
+            on_reload_clicked=self._reload_application,
+        )
         self.transition = ModuleTransitionScreen()
 
         self.stack.addWidget(self.login)
@@ -563,6 +577,11 @@ class MainWindow(QMainWindow):
         fade_in(self.personal, 650)
         self.statusBar().showMessage("Personal iniciado", 5000)
 
+    def _reload_application(self) -> None:
+        self.close()
+        subprocess.Popen([sys.executable, __file__])
+        QApplication.quit()
+
     def closeEvent(self, event) -> None:
         if _KSP_AVAILABLE and hasattr(self, 'visualizer') and self.visualizer is not None:
             self.visualizer.timer.stop()
@@ -670,6 +689,18 @@ def build_stylesheet() -> str:
         font-weight: 700;
     }
     QPushButton#primaryButton:hover {
+        background: #2585aa;
+        border-color: #9ee4f5;
+    }
+    QPushButton#reloadButton {
+        background: #1d6f91;
+        color: #f3fbff;
+        border: 1px solid #66c7e8;
+        border-radius: 9px;
+        padding: 6px 12px;
+        font-weight: 700;
+    }
+    QPushButton#reloadButton:hover {
         background: #2585aa;
         border-color: #9ee4f5;
     }

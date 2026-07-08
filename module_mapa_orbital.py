@@ -10,7 +10,7 @@ import os
 import time
 from pathlib import Path
 
-from PyQt6.QtCore import pyqtSignal, QTimer, Qt, QRect, QEasingCurve, QPropertyAnimation
+from PyQt6.QtCore import pyqtSignal, QTimer, Qt, QRect, QEasingCurve, QPropertyAnimation, QPointF
 from PyQt6.QtGui import QMouseEvent, QWheelEvent, QPainter, QPen, QColor, QPixmap, QFont, QFontMetrics, QVector3D
 from PyQt6.QtWidgets import QWidget, QLabel, QVBoxLayout, QLineEdit, QPushButton, QFrame, QScrollArea, QLayout, QMessageBox
 from PySide6.QtCore import QVariantAnimation
@@ -87,10 +87,13 @@ if _KSP_AVAILABLE:
             from PyQt6.QtCore import QPointF
             global_pos = self.mapToGlobal(event.position().toPoint())
             view_pos = self._view.mapFromGlobal(global_pos)
+            # Crear un evento sintético equivalente no es trivial en PyQt6;
+            # en su lugar llamamos directamente al handler personalizado del visualizador.
             return view_pos
 
         def mousePressEvent(self, event):
             if not self._hit_interactive_child(event.position().toPoint()):
+                # Crear evento equivalente en el view y llamar al handler
                 from PyQt6.QtGui import QMouseEvent
                 global_pos = self.mapToGlobal(event.position().toPoint())
                 view_local = self._view.mapFromGlobal(global_pos)
@@ -175,7 +178,7 @@ if _KSP_AVAILABLE:
             layout.setContentsMargins(8, 6, 8, 6)
             layout.setSpacing(2)
 
-            title = QLabel(f"🛰  {name}")
+            title = QLabel(f"{name}")
             title.setStyleSheet(f"color: {self._base_hex}; font-weight: bold; font-size: 11px;")
             layout.addWidget(title)
 
@@ -262,6 +265,12 @@ if _KSP_AVAILABLE:
             self.hovered_vessel = None
             self.last_press_pos = None
 
+            # Alfa actual / objetivo por nave, usados para oscurecer de forma
+            # suave y transicionada las órbitas y satélites que no están bajo
+            # el cursor cuando se hace hover sobre uno de ellos.
+            self._hover_current: dict = {}
+            self._hover_targets: dict = {}
+
             self.last_mouse_pos = None
             self.is_rotating = False
             self._press_pos = None
@@ -273,6 +282,8 @@ if _KSP_AVAILABLE:
             self.timer = QTimer(self)
             self.timer.timeout.connect(self._update_orbits)
 
+            # Timer de animación: extrapola posiciones Keplerianas entre
+            # actualizaciones del servidor para lograr un movimiento fluido (~33 FPS).
             self.animation_timer = QTimer(self)
             self.animation_timer.timeout.connect(self._animate_satellites)
 
@@ -340,15 +351,20 @@ if _KSP_AVAILABLE:
             """)
 
         def _build_ui(self):
+            import os
+            from PyQt6.QtGui import QPixmap
+            from PyQt6.QtWidgets import QSizePolicy, QLayout # <--- Añadido para controlar el tamaño
+
+            # El mapa ocupa TODA la pantalla
+            root_layout = QVBoxLayout(self)
+            root_layout.setContentsMargins(0, 0, 0, 0)
+            root_layout.setSpacing(0)
+
             # Vista 3D a pantalla completa
             self.view = gl.GLViewWidget(self)
             self.view.setBackgroundColor('#0d1117')
             self.view.setCameraPosition(distance=5200, elevation=22, azimuth=-45)
             self.view.setMouseTracking(True)
-
-            root_layout = QVBoxLayout(self)
-            root_layout.setContentsMargins(0, 0, 0, 0)
-            root_layout.setSpacing(0)
             root_layout.addWidget(self.view)
 
             # Info bubble (tooltip flotante sobre el mapa)
@@ -366,19 +382,22 @@ if _KSP_AVAILABLE:
             """)
             self.info_bubble.hide()
 
-            # Overlay panel (sobre el mapa, esquina superior-izquierda)
+            # ── Overlay panel (sobre el mapa, esquina superior-izquierda) ──────
             self.overlay = PassthroughOverlay(self.view, self)
             self.overlay.setFixedWidth(260)
+
+            # Le damos un fondo oscuro, borde y esquinas redondeadas idénticas a tus otros paneles
             self.overlay.setStyleSheet("""
                 PassthroughOverlay, QWidget {
                     background: rgba(13, 17, 23, 180);
                     border-radius: 8px;
                 }
                 QLineEdit, QFrame, QLabel, QPushButton {
-                    background: transparent;
+                    background: transparent; /* Evita que los hijos hereden el fondo de forma incorrecta */
                 }
             """)
 
+            # Forzamos a que el layout ajuste el contenedor al tamaño mínimo de sus elementos (Logo + Buscador)
             overlay_layout = QVBoxLayout(self.overlay)
             overlay_layout.setContentsMargins(12, 14, 12, 14)
             overlay_layout.setSpacing(10)
@@ -402,6 +421,17 @@ if _KSP_AVAILABLE:
             self.txt_filter.setPlaceholderText("Buscar objeto…")
             self.txt_filter.setClearButtonEnabled(True)
             self.txt_filter.textChanged.connect(self._apply_filter)
+            self.txt_filter.setStyleSheet("""
+                QLineEdit {
+                    background: rgba(13,17,23,210);
+                    border: 1px solid #30363d;
+                    border-radius: 6px;
+                    color: #c9d1d9;
+                    padding: 7px 10px;
+                    font-size: 12px;
+                }
+                QLineEdit:focus { border-color: #58a6ff; }
+            """)
             overlay_layout.addWidget(self.txt_filter)
 
             # Contenedor animado de resultados
@@ -410,7 +440,7 @@ if _KSP_AVAILABLE:
             self.results_layout = QVBoxLayout(self.results_widget)
             self.results_layout.setContentsMargins(0, 2, 0, 2)
             self.results_layout.setSpacing(2)
-            self.results_widget.setMaximumHeight(0)
+            self.results_widget.setMaximumHeight(0)   # Oculto inicialmente
             overlay_layout.addWidget(self.results_widget)
 
             # Panel de información del satélite seleccionado
@@ -463,7 +493,9 @@ if _KSP_AVAILABLE:
             self.info_panel.hide()
             overlay_layout.addWidget(self.info_panel)
 
-            # Dummy widgets para compatibilidad interna
+            # overlay_layout.addStretch()  <--- ELIMINADO para evitar que empuje y expanda el menú
+
+            # Dummy widgets para compatibilidad interna (no visibles)
             self.btn_connect    = QPushButton()
             self.btn_connect.clicked.connect(self._connect_to_ksp)
             self.btn_disconnect = QPushButton()
@@ -492,13 +524,19 @@ if _KSP_AVAILABLE:
             self.view.mouseReleaseEvent = self._mouse_release
             self.view.wheelEvent        = self._wheel_event
 
+            
+
         def _make_separator(self) -> QFrame:
             sep = QFrame()
             sep.setFrameShape(QFrame.Shape.HLine)
             sep.setStyleSheet("color: #21262d; margin: 2px 0;")
             return sep
 
+        # ── Resultados de búsqueda animados ───────────────────────────────────
+
         def _rebuild_results(self):
+            """Reconstruye la lista de resultados según el filtro activo."""
+            # Limpiar resultados anteriores
             while self.results_layout.count():
                 item = self.results_layout.takeAt(0)
                 w = item.widget()
@@ -523,7 +561,7 @@ if _KSP_AVAILABLE:
                 return
 
             for vid in matches:
-                btn = QPushButton(f"🛰  {vid}")
+                btn = QPushButton(f"{vid}")
                 btn.setStyleSheet("""
                     QPushButton {
                         background: rgba(13,17,23,210);
@@ -558,9 +596,11 @@ if _KSP_AVAILABLE:
             self._results_anim.start()
 
         def _select_vessel(self, vessel_name: str):
+            """Selecciona un satélite: muestra info, oculta resultados, hace zoom."""
             if vessel_name not in self.render_objects:
                 return
             self.selected_vessel = vessel_name
+            # Limpiar búsqueda y cerrar resultados
             self.txt_filter.blockSignals(True)
             self.txt_filter.clear()
             self.txt_filter.blockSignals(False)
@@ -570,9 +610,13 @@ if _KSP_AVAILABLE:
             self._update_selection_visuals()
             self._update_info_panel(vessel_name)
             self.info_panel.show()
+
+            # Zoom y seguimiento de cámara inicial (reinicia ángulos y zoom)
             self._focus_camera_on(vessel_name, initial=True)
 
         def _animate_camera_to(self, target_pos, target_dist, target_azim, target_elev, duration=900):
+            from PyQt6.QtCore import QVariantAnimation, QEasingCurve
+            
             if hasattr(self, '_camera_anim_obj') and self._camera_anim_obj is not None:
                 self._camera_anim_obj.stop()
                 
@@ -606,6 +650,7 @@ if _KSP_AVAILABLE:
             anim.start()
 
         def _focus_camera_on(self, vessel_name: str, initial: bool = False):
+            """Centra la cámara en el satélite seleccionado. Preserva zoom y rotación a menos que initial=True."""
             obj = self.render_objects.get(vessel_name)
             if obj is None or 'pos_3d' not in obj:
                 return
@@ -614,6 +659,7 @@ if _KSP_AVAILABLE:
             if initial:
                 dist = max(800.0, math.hypot(math.hypot(sx, sy), sz) * 1.8)
                 dist = min(dist, 4000.0)
+                # Calcular azimut y elevación para apuntar a la posición
                 azim = math.degrees(math.atan2(sy, sx))
                 elev = math.degrees(math.atan2(sz, math.hypot(sx, sy)))
                 self._animate_camera_to(pos, dist, azim, elev, duration=900)
@@ -628,6 +674,7 @@ if _KSP_AVAILABLE:
                     self.view.update()
 
         def _update_info_panel(self, vessel_name: str):
+            """Rellena el panel con los datos del satélite en texto limpio."""
             obj = self.render_objects.get(vessel_name, {})
             info = obj.get('info_data', {})
             cidx = obj.get('color_idx', 0)
@@ -636,7 +683,7 @@ if _KSP_AVAILABLE:
                 int(color[0]*255), int(color[1]*255), int(color[2]*255)
             )
             self.info_title.setText(
-                f"<span style='color:{color_hex}'>🛰 {vessel_name}</span>"
+                f"<span style='color:{color_hex}'>{vessel_name}</span>"
             )
 
             alt_km  = info.get('alt_km', 0)
@@ -645,8 +692,8 @@ if _KSP_AVAILABLE:
             ecc     = info.get('ecc', 0)
             vel_ms  = info.get('vel_ms', 0)
 
-            c_key = "#6e7681"
-            c_val = "#e6edf3"
+            c_key = "#6e7681"   # color etiqueta
+            c_val = "#e6edf3"   # color valor
             self.info_body.setText(
                 f"<span style='color:{c_key}'>Altitud</span>  "
                 f"<span style='color:{c_val}'>{alt_km:,.0f} km</span><br>"
@@ -661,6 +708,7 @@ if _KSP_AVAILABLE:
             )
 
         def _deselect_vessel(self):
+            """Cierra el panel de info y restaura la vista general fluidamente."""
             self.selected_vessel = None
             self.info_panel.hide()
             self._hide_info_bubble()
@@ -713,7 +761,7 @@ if _KSP_AVAILABLE:
             self.animation_timer.start(30)
 
         def _on_connect_failed(self, err: str):
-            pass
+            pass  # Sin UI de estado visible
 
         def _disconnect(self):
             self.timer.stop()
@@ -741,6 +789,8 @@ if _KSP_AVAILABLE:
                             pass
 
             self.render_objects.clear()
+            self._hover_current.clear()
+            self._hover_targets.clear()
 
             for vid, streams in self.vessel_streams.items():
                 for s in streams.values():
@@ -764,6 +814,7 @@ if _KSP_AVAILABLE:
             self.back_clicked.emit()
 
         def _set_selected_vessel(self, vessel_name: str):
+            """Redirige a _select_vessel para compatibilidad."""
             self._select_vessel(vessel_name)
 
         def _project_point(self, point_3d):
@@ -839,7 +890,7 @@ if _KSP_AVAILABLE:
                 int(color[1] * 255),
                 int(color[2] * 255)
             )
-            return f"<b style='color:{color_hex}'>🛰 {vessel_name}</b>"
+            return f"<b style='color:{color_hex}'>{vessel_name}</b>"
 
         def _show_info_bubble(self, vessel_name: str, px: float, py: float):
             if self.info_bubble is None:
@@ -866,7 +917,11 @@ if _KSP_AVAILABLE:
             if self.selected_vessel is not None and self.selected_vessel not in self.render_objects:
                 self.selected_vessel = None
 
-            has_hover = self.hovered_vessel is not None and self.selected_vessel is None
+            # Fija los nuevos objetivos de alfa para el fundido de hover; la
+            # transición suave hacia esos objetivos la realiza cada frame
+            # _animate_hover_alpha, en vez de aplicar el oscurecido de golpe.
+            self._compute_hover_targets()
+
             highlighted_items = []
 
             for vid, obj in self.render_objects.items():
@@ -878,51 +933,30 @@ if _KSP_AVAILABLE:
                 dot = obj.get('dot')
                 trail = obj.get('trail_line')
 
-                if has_hover:
-                    if is_hovered:
-                        line_color = obj.get('base_line_color', ORBIT_LINE_COLOR)
-                        line_width = 3.5
-                        dot_color = obj.get('base_dot_color')
-                        trail_visible = True
-                    else:
-                        line_color = (0.02, 0.07, 0.09, 0.08)
-                        line_width = 1.0
-                        base_dot = obj.get('base_dot_color')
-                        if base_dot is not None:
-                            dot_color = (base_dot[0]*0.16, base_dot[1]*0.16, base_dot[2]*0.16, 0.2)
-                        else:
-                            dot_color = (0.16, 0.16, 0.16, 0.2)
-                        trail_visible = False
-                else:
-                    line_color = obj.get('base_line_color', ORBIT_LINE_COLOR)
-                    line_width = 3.5 if is_selected else 1.5
-                    dot_color = obj.get('base_dot_color')
-                    trail_visible = show_in_map
+                line_width = 3.5 if (is_selected or is_hovered) else 1.5
 
                 if line is not None:
                     line.setVisible(show_in_map)
-                    if show_in_map and line_color is not None:
-                        line.setData(pos=obj['orbit_pts'], color=line_color, width=line_width)
+                    if show_in_map:
+                        line.setData(pos=obj['orbit_pts'], width=line_width)
                         if is_hovered or is_selected:
                             highlighted_items.append(line)
 
                 if dot is not None:
                     dot.setVisible(show_in_map)
-                    if show_in_map and dot_color is not None:
-                        dot.setData(pos=np.array([obj['pos_3d']], dtype=np.float32), color=dot_color)
-                        if is_hovered or is_selected:
-                            highlighted_items.append(dot)
+                    if show_in_map and (is_hovered or is_selected):
+                        highlighted_items.append(dot)
 
                 if trail is not None:
-                    trail.setVisible(trail_visible)
-                    if trail_visible:
-                        trail_colors = obj.get('trail_colors')
-                        ordered = obj.get('ordered_trail')
-                        if trail_colors is not None and ordered is not None:
-                            trail.setData(pos=ordered, color=trail_colors)
-                        if is_hovered or is_selected:
-                            highlighted_items.append(trail)
+                    # El rastro se mantiene visible mientras el satélite esté en
+                    # el mapa; su atenuación por hover se aplica de forma
+                    # progresiva en _animate_hover_alpha, no aquí.
+                    trail.setVisible(show_in_map)
+                    if show_in_map and (is_hovered or is_selected):
+                        highlighted_items.append(trail)
 
+            # PyQtGraph pinta los GL items en orden de insercion; reinsertar el destacado
+            # evita que una orbita atenuada de la misma trayectoria se mezcle por encima.
             for item in highlighted_items:
                 try:
                     self.view.removeItem(item)
@@ -930,8 +964,66 @@ if _KSP_AVAILABLE:
                 except Exception:
                     pass
 
+        def _compute_hover_targets(self):
+            """Calcula, para cada nave, el alfa objetivo según el hover/selección
+            actual. No aplica el color todavía: la interpolación suave hacia
+            estos objetivos ocurre en _animate_hover_alpha en cada frame."""
+            has_hover = self.hovered_vessel is not None and self.selected_vessel is None
+
+            for vid in self.render_objects:
+                if has_hover:
+                    self._hover_targets[vid] = 1.0 if vid == self.hovered_vessel else 0.08
+                else:
+                    self._hover_targets[vid] = 1.0
+
+        def _animate_hover_alpha(self):
+            """Interpola el alfa actual de cada nave hacia su objetivo y aplica
+            el color resultante a su órbita, punto y estela, logrando un
+            oscurecido suave y transicionado en lugar de un cambio brusco."""
+            if not self.render_objects:
+                return
+
+            factor = 0.15  # velocidad de la transición por frame
+
+            for vid, obj in self.render_objects.items():
+                target = self._hover_targets.get(vid, 1.0)
+                current = self._hover_current.get(vid, 1.0)
+
+                diff = target - current
+                if abs(diff) < 0.001:
+                    current = target
+                else:
+                    current += diff * factor
+                    current = min(current, target) if diff > 0 else max(current, target)
+
+                self._hover_current[vid] = current
+
+                # Línea orbital
+                line = obj.get('line')
+                base_line = obj.get('base_line_color')
+                if line is not None and base_line is not None:
+                    line.setData(color=(base_line[0], base_line[1], base_line[2],
+                                         base_line[3] * current))
+
+                # Punto (satélite)
+                dot = obj.get('dot')
+                base_dot = obj.get('base_dot_color')
+                if dot is not None and base_dot is not None:
+                    dot.setData(color=(base_dot[0], base_dot[1], base_dot[2],
+                                        base_dot[3] * current))
+
+                # Estela
+                trail = obj.get('trail_line')
+                base_trail = obj.get('base_trail_colors')
+                ordered = obj.get('ordered_trail')
+                if trail is not None and base_trail is not None and ordered is not None:
+                    faded_trail = base_trail.copy()
+                    faded_trail[:, 3] = base_trail[:, 3] * current
+                    trail.setData(pos=ordered, color=faded_trail)
+
         def _apply_filter(self, text: str):
             self.active_filter_text = (text or "").strip().lower()
+            # Si hay texto activo, deseleccionar y ocultar info panel
             if self.active_filter_text:
                 if self.selected_vessel is not None:
                     self.selected_vessel = None
@@ -939,6 +1031,7 @@ if _KSP_AVAILABLE:
                     self._hide_info_bubble()
                     self._update_selection_visuals()
             else:
+                # Campo vacío: colapsar resultados sin deselectar
                 self._animate_results(0)
                 return
             self._rebuild_results()
@@ -966,6 +1059,7 @@ if _KSP_AVAILABLE:
                         )
 
             self._load_all_vessels_initially()
+            # Refrescar panel de info si hay selección activa (no reinicia la orientación)
             if self.selected_vessel is not None and self.selected_vessel in self.render_objects:
                 self._update_info_panel(self.selected_vessel)
                 self._focus_camera_on(self.selected_vessel, initial=False)
@@ -1123,6 +1217,7 @@ if _KSP_AVAILABLE:
                                 'trail_head': 0,
                                 'trail_filled': False,
                                 'trail_colors': trail_colors,
+                                'base_trail_colors': trail_colors.copy(),
                                 'base_line_color': ORBIT_LINE_COLOR,
                                 'base_dot_color': dc,
                                 'pos_3d': (sx, sy, sz),
@@ -1136,6 +1231,10 @@ if _KSP_AVAILABLE:
                                 'true_anomaly_base': true_anom,
                                 'last_update_time': time.time(),
                             }
+
+                            # Estado de fundido para el oscurecido suave por hover
+                            self._hover_current[vid] = 1.0
+                            self._hover_targets[vid] = 1.0
                         else:
                             obj = self.render_objects[vid]
                             now_t = time.time()
@@ -1187,6 +1286,8 @@ if _KSP_AVAILABLE:
                                 except Exception:
                                     pass
                         del self.render_objects[vid]
+                        self._hover_current.pop(vid, None)
+                        self._hover_targets.pop(vid, None)
                         if self.selected_vessel == vid:
                             self.selected_vessel = None
                             self.info_panel.hide()
@@ -1207,6 +1308,8 @@ if _KSP_AVAILABLE:
                     self._camera_fitted = True
 
                 self._update_selection_visuals()
+
+                # Guardar naves activas para actualizar secuencialmente
                 self.vessels_to_update = [v for v in vessels if v.name in active_vids]
                 self.current_vessel_index = 0
 
@@ -1218,6 +1321,7 @@ if _KSP_AVAILABLE:
                 return
 
             try:
+                # Si hemos recorrido todas las naves, solicitamos los datos globales (número de satélites / cambios)
                 if not hasattr(self, 'vessels_to_update') or not self.vessels_to_update or self.current_vessel_index >= len(self.vessels_to_update):
                     vessels = list(self.conn.space_center.vessels)
                     active_vids = set()
@@ -1274,6 +1378,8 @@ if _KSP_AVAILABLE:
                                     except Exception:
                                         pass
                             del self.render_objects[vid]
+                            self._hover_current.pop(vid, None)
+                            self._hover_targets.pop(vid, None)
                             if self.selected_vessel == vid:
                                 self.selected_vessel = None
                                 self.info_panel.hide()
@@ -1295,6 +1401,7 @@ if _KSP_AVAILABLE:
                 if not self.vessels_to_update:
                     return
 
+                # Actualizar el siguiente satélite
                 vessel = self.vessels_to_update[self.current_vessel_index]
                 self.current_vessel_index += 1
 
@@ -1369,7 +1476,7 @@ if _KSP_AVAILABLE:
                         r_now2 * np.cos(resolved_anom),
                         r_now2 * np.sin(resolved_anom),
                         0.0
-                     ]))
+                    ]))
                     sx, sy, sz = float(pos_now2[0]), float(pos_now2[1]), float(pos_now2[2])
 
                 obj['orbit_pts'] = rotated
@@ -1407,9 +1514,13 @@ if _KSP_AVAILABLE:
                 self._handle_update_error(e)
 
         def _propagate_true_anomaly(self, ecc, period, ta_base, dt):
+            """Devuelve la anomalía verdadera tras `dt` segundos a partir de
+            `ta_base`, usando movimiento medio Kepleriano. Reutilizado tanto
+            por la animación de cada frame como por la corrección anti-salto
+            cuando llega un dato real del servidor."""
             if dt < 0:
                 dt = 0.0
-            n = 2.0 * math.pi / period
+            n = 2.0 * math.pi / period  # movimiento medio (rad/s)
 
             if ecc < 0.999:
                 E0 = 2.0 * math.atan2(
@@ -1420,6 +1531,7 @@ if _KSP_AVAILABLE:
                 M = M0 + n * dt
                 M = math.fmod(M, 2.0 * math.pi)
 
+                # Resolver la ecuación de Kepler M = E - e*sin(E) (Newton-Raphson)
                 E = M
                 for _ in range(6):
                     f = E - ecc * math.sin(E) - M
@@ -1433,9 +1545,21 @@ if _KSP_AVAILABLE:
                     math.sqrt(max(1e-12, 1 - ecc)) * math.cos(E / 2.0)
                 )
             else:
+                # Órbitas hiperbólicas / parabólicas: extrapolación lineal simple
                 return ta_base + n * dt
 
         def _resolve_server_anomaly(self, obj, true_anom, ecc, period, now_t):
+            """Concilia el dato real recibido del servidor con la posición ya
+            extrapolada localmente, evitando que el satélite 'retroceda'
+            visualmente por jitter o latencia de los streams de krpc.
+
+            Si el dato del servidor queda por detrás de donde ya habíamos
+            extrapolado (caso típico: la llamada al stream tarda unos ms y
+            trae un estado ligeramente más antiguo que 'ahora'), se conserva
+            la posición ya extrapolada y se sigue avanzando desde ahí. Si el
+            servidor va por delante (p. ej. tras una maniobra real), se
+            adopta directamente el nuevo valor.
+            """
             prev_ta_base = obj.get('true_anomaly_base')
             prev_t0 = obj.get('last_update_time')
             prev_ecc = obj.get('ecc')
@@ -1454,6 +1578,9 @@ if _KSP_AVAILABLE:
                     math.sin(true_anom - predicted),
                     math.cos(true_anom - predicted)
                 )
+                # diff < 0  => el dato del servidor va "por detrás" de lo ya
+                # mostrado: ignoramos el retroceso y mantenemos la posición
+                # extrapolada para no producir un salto hacia atrás visible.
                 if diff < 0:
                     return predicted
                 return true_anom
@@ -1461,6 +1588,11 @@ if _KSP_AVAILABLE:
                 return true_anom
 
         def _animate_satellites(self):
+            """Extrapola la posición de cada satélite a partir de su última
+            actualización real usando física Kepleriana (movimiento medio),
+            de forma que el movimiento se vea continuo y fluido a ~33 FPS,
+            sin importar cuántos satélites haya ni el orden en que el
+            servidor los vaya actualizando."""
             if not self.render_objects:
                 return
 
@@ -1499,6 +1631,10 @@ if _KSP_AVAILABLE:
                 except Exception:
                     continue
 
+            # Transición suave del oscurecido por hover
+            self._animate_hover_alpha()
+
+            # Seguimiento de cámara fluido sobre el satélite seleccionado
             if selected is not None and selected in self.render_objects:
                 self._focus_camera_on(selected, initial=False)
 
@@ -1521,14 +1657,18 @@ if _KSP_AVAILABLE:
                 self.last_mouse_pos = event.position()
                 if hit is not None:
                     return
+                # Guardar posición del press para distinguir click de drag
                 self._press_pos = event.position()
+                self.is_rotating = True
+                self.last_mouse_pos = event.position()
 
         def _mouse_release(self, event):
             if event.button() == Qt.MouseButton.LeftButton:
                 self.is_rotating = False
+                # Solo deseleccionar si fue un click puro (sin arrastre)
                 if self._press_pos is not None:
                     delta = event.position() - self._press_pos
-                    is_click = (delta.x() ** 2 + delta.y() ** 2) < 16
+                    is_click = (delta.x() ** 2 + delta.y() ** 2) < 16  # < 4px de movimiento
                     release_hit = self._vessel_at_cursor(event)
 
                     if (
@@ -1608,22 +1748,26 @@ if _KSP_AVAILABLE:
                 h = self.btn_back.height()
                 self.btn_back.setFixedSize(w, h)
                 
+                # --- NUEVO: Estilo transparente con subrayado al pasar el cursor ---
                 self.btn_back.setStyleSheet("""
                     QPushButton {
                         background: transparent;
                         border: none;
-                        color: #FFFFFF;
+                        color: #FFFFFF; /* Cambia el color del texto si lo necesitas */
                         text-decoration: none;
                     }
                     QPushButton:hover {
                         text-decoration: underline;
                     }
                 """)
+                # -----------------------------------------------------------------
 
+                # Posición: esquina inferior-izquierda
                 self.btn_back.move(16, self.height() - h - 16)
                 self.btn_back.raise_()
+
 else:
-    class KSPRealTimeVisualizer(QWidget):
+    class KSPRealTimeVisualizer(QWidget):  # type: ignore
         back_clicked = pyqtSignal()
         def __init__(self, conn=None, parent=None):
             super().__init__(parent)
