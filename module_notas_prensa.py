@@ -10,12 +10,12 @@ import mimetypes
 from pathlib import Path
 
 from PyQt6.QtCore import pyqtSignal, Qt, QRectF, QSize, QUrl, QDate, QEvent, QTimer
-from PyQt6.QtGui import QIcon, QPixmap, QPainter, QPen, QColor, QFont, QFontMetrics, QTextCursor, QTextDocument
+from PyQt6.QtGui import QIcon, QPixmap, QPainter, QPen, QColor, QFont, QFontMetrics, QTextCursor, QTextDocument, QAction, QDesktopServices
 from PyQt6.QtWidgets import (
     QWidget, QLabel, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton, QFrame,
     QScrollArea, QStackedWidget, QListWidget, QListWidgetItem, QFileDialog,
     QDateEdit, QGridLayout, QMessageBox, QTextEdit, QTextBrowser, QMenu, QToolButton,
-    QMainWindow, QApplication, QGraphicsOpacityEffect, QDialog
+    QMainWindow, QApplication, QGraphicsOpacityEffect, QDialog, QSizePolicy
 )
 
 from core_shared import (

@@ -195,18 +195,35 @@ DEFAULT_SATELLITE_GROUPS = {
         "max_alt_km": None,
         "system": True,
     },
+    "EXTERNO": {
+        "name": "EXTERNO",
+        "full_name": "Cuerpo Externo",
+        "description": "Satélites que orbitan un cuerpo distinto de Kerbin y la Luna",
+        "min_alt_km": None,
+        "max_alt_km": None,
+        "system": True,
+    },
 }
 
-SATELLITE_GROUP_LUNAR = "SATÉLITES LUNARES"
+SATELLITE_GROUP_LUNAR    = "SATÉLITES LUNARES"
+SATELLITE_GROUP_EXTERNAL = "EXTERNO"
 
 # Nombres (normalizados en minúsculas) que identifican a la Luna como cuerpo
 # orbitado. Cubre KSP estándar ("Mun"), Real Solar System ("Moon") y guardados
 # traducidos ("Luna"). Añade aquí otras variantes si tu partida usa otro nombre.
 LUNAR_BODY_NAMES = {"mun", "moon", "luna"}
 
+# Nombres (normalizados en minúsculas) del planeta principal (Kerbin/Earth).
+# Cualquier cuerpo que NO sea Kerbin ni lunar recibirá el grupo EXTERNO.
+KERBIN_BODY_NAMES = {"kerbin", "earth"}
+
 
 def _is_lunar_body(body_name: str) -> bool:
     return _normalize_key(str(body_name or "")) in LUNAR_BODY_NAMES
+
+
+def _is_kerbin_body(body_name: str) -> bool:
+    return _normalize_key(str(body_name or "")) in KERBIN_BODY_NAMES
 
 
 def apply_shadow(widget: QWidget, blur: int = 28, alpha: int = 90) -> None:
@@ -1034,8 +1051,7 @@ class PressStore:
         self.load()
 
     def _ensure_structure(self) -> None:
-        for folder in (PRESS_DIR, PRESS_MEDIA_DIR, PRESS_MEDIA_IMAGES_DIR, PRESS_MEDIA_VIDEOS_DIR, PRESS_MEDIA_DOCUMENTS_DIR):
-            folder.mkdir(parents=True, exist_ok=True)
+        PRESS_DIR.mkdir(parents=True, exist_ok=True)
 
     def load(self) -> None:
         self._ensure_structure()
@@ -1047,7 +1063,7 @@ class PressStore:
             for entry in raw_notes:
                 if isinstance(entry, dict):
                     self.notes.append(entry)
-        self._normalize_notes(import_media=False)
+        self._normalize_notes(import_media=True)
 
     def save(self) -> None:
         self._ensure_structure()
@@ -1166,24 +1182,20 @@ class PressStore:
         date_obj = QDate.currentDate()
         return date_obj.toString("yyyy-MM-dd")
 
-    def _media_target_dir(self, media_type: str) -> Path:
-        if media_type == "image":
-            return PRESS_MEDIA_IMAGES_DIR
-        if media_type == "video":
-            return PRESS_MEDIA_VIDEOS_DIR
-        return PRESS_MEDIA_DOCUMENTS_DIR
+    def _media_target_dir(self, note_id: int) -> Path:
+        return PRESS_DIR / f"nota_{note_id}"
 
     def _import_media_file(self, note_id: int, source_path: str, media_type: str) -> str:
         source = Path(source_path)
         if not source.exists():
             return source_path
         source = source.resolve()
+        target_dir = self._media_target_dir(note_id)
         try:
-            if source.is_relative_to(PRESS_DIR):
+            if source.is_relative_to(target_dir):
                 return _press_relativize_path(source)
         except Exception:
             pass
-        target_dir = self._media_target_dir(media_type)
         target_dir.mkdir(parents=True, exist_ok=True)
         suffix = source.suffix.lower()
         stem = _normalize_key(source.stem) or f"note_{note_id}"
@@ -1251,15 +1263,37 @@ class PressStore:
 
     def _prune_unused_media(self) -> None:
         referenced = self._iter_media_paths()
-        for directory in (PRESS_MEDIA_IMAGES_DIR, PRESS_MEDIA_VIDEOS_DIR, PRESS_MEDIA_DOCUMENTS_DIR):
-            if not directory.exists():
+        # Buscar todas las carpetas tipo "nota_*" en PRESS_DIR
+        for item in PRESS_DIR.glob("nota_*"):
+            if not item.is_dir():
                 continue
-            for file_path in directory.rglob("*"):
+            for file_path in item.rglob("*"):
                 if file_path.is_file() and file_path.resolve() not in referenced:
                     try:
                         file_path.unlink()
                     except Exception:
                         pass
+            # Si después de limpiar la carpeta queda vacía, la eliminamos
+            try:
+                if not any(item.iterdir()):
+                    item.rmdir()
+            except Exception:
+                pass
+        # También podar el antiguo directorio global de media si existe
+        if PRESS_MEDIA_DIR.exists():
+            for file_path in PRESS_MEDIA_DIR.rglob("*"):
+                if file_path.is_file() and file_path.resolve() not in referenced:
+                    try:
+                        file_path.unlink()
+                    except Exception:
+                        pass
+            # Intentar limpiar carpetas vacías del antiguo media
+            for sub in (PRESS_MEDIA_IMAGES_DIR, PRESS_MEDIA_VIDEOS_DIR, PRESS_MEDIA_DOCUMENTS_DIR, PRESS_MEDIA_DIR):
+                try:
+                    if sub.exists() and not any(sub.iterdir()):
+                        sub.rmdir()
+                except Exception:
+                    pass
 
 
 class SatelliteStore:
@@ -1421,9 +1455,20 @@ class SatelliteStore:
         return []
 
     def _groups_for_orbit_body(self, body_name: str) -> list[str]:
+        """Devuelve los grupos automáticos derivados del cuerpo orbitado.
+
+        - Lunar   → [SATELLITE_GROUP_LUNAR]
+        - Kerbin  → [] (los grupos de altitud (LEO/MEO…) ya se añaden aparte)
+        - Vacío   → [] (cuerpo desconocido, no se añade EXTERNO sin certeza)
+        - Otro    → [SATELLITE_GROUP_EXTERNAL]
+        """
+        if not body_name:
+            return []
         if _is_lunar_body(body_name):
             return [SATELLITE_GROUP_LUNAR]
-        return []
+        if _is_kerbin_body(body_name):
+            return []
+        return [SATELLITE_GROUP_EXTERNAL]
 
     def _default_game_payload(self, game_uid: str, save_name: str = "", save_path: str = "", install_root: str = "") -> dict:
         return {
@@ -1492,7 +1537,7 @@ class SatelliteStore:
             )
             self.current_game_uid = legacy_uid
 
-        self._normalize_records()
+        normalized_changed = self._normalize_records()
         if not self.current_game_uid or self.current_game_uid not in self.games:
             if self.games:
                 preferred = next((uid for uid in self.games if any(r.get("game_uid") == uid for r in self.records)), None)
@@ -1502,7 +1547,7 @@ class SatelliteStore:
         if self.current_game_uid not in self.games:
             self.games[self.current_game_uid] = self._default_game_payload(self.current_game_uid, save_name="Legado")
         self.last_signature = str(self.games.get(self.current_game_uid, {}).get("signature", self.last_signature))
-        if self._deduplicate_auto_records(self.current_game_uid):
+        if self._deduplicate_auto_records(self.current_game_uid) or normalized_changed:
             self.save()
 
     def save(self) -> None:
@@ -1518,10 +1563,12 @@ class SatelliteStore:
             "games": list(self.games.values()),
         })
 
-    def _normalize_records(self) -> None:
+    def _normalize_records(self) -> bool:
         max_id = 0
         fallback_game_uid = self.current_game_uid or self._legacy_game_uid()
+        changed = False
         for record in self.records:
+            old_record = {k: (list(v) if isinstance(v, list) else (dict(v) if isinstance(v, dict) else v)) for k, v in record.items()}
             orbit = record.get("orbit") or {}
             groups_auto = list(record.get("groups_auto") or [])
             groups_manual = list(record.get("groups_manual") or [])
@@ -1544,13 +1591,15 @@ class SatelliteStore:
                 groups_auto = [_auto_group_for_altitude(float(orbit.get("apoapsis_km", 0) or 0))]
                 groups_auto += _lunar_grp
             else:
-                # Re-evaluar siempre el grupo lunar aunque groups_auto ya esté poblado
-                groups_auto = [g for g in groups_auto if g != SATELLITE_GROUP_LUNAR]
+                # Re-evaluar siempre los grupos por cuerpo (lunar y externo) aunque groups_auto ya esté poblado
+                groups_auto = [g for g in groups_auto
+                               if g not in (SATELLITE_GROUP_LUNAR, SATELLITE_GROUP_EXTERNAL)]
                 groups_auto += _lunar_grp
             if not groups_manual and legacy_group and legacy_group not in DEFAULT_SATELLITE_GROUPS:
                 groups_manual = [legacy_group]
             elif not groups_manual and legacy_group and legacy_group in DEFAULT_SATELLITE_GROUPS and not record.get("group_manual", False):
-                groups_auto = [legacy_group]
+                if legacy_group not in groups_auto:
+                    groups_auto.append(legacy_group)
 
             record["groups_auto"] = self._unique_groups(groups_auto)
             record["groups_manual"] = self._filter_manual_groups(groups_manual)
@@ -1561,8 +1610,16 @@ class SatelliteStore:
                 record["ksp_identity_key"] = self._satellite_key(record.get("name", ""), record.get("launch_ut"), orbit)
             max_id = max(max_id, int(record["id"]))
 
+            # Comparar campos clave para detectar cambios
+            for k in ["game_uid", "ksp_identity_key", "status", "status_mode", "groups_auto", "groups_manual", "groups", "group", "group_manual"]:
+                if record.get(k) != old_record.get(k):
+                    changed = True
+                    break
+
         if self.next_id <= max_id:
             self.next_id = max_id + 1
+            changed = True
+        return changed
 
     def _sync_group_fields(self, record: dict) -> None:
         record["groups_auto"] = self._unique_groups(list(record.get("groups_auto") or []))
