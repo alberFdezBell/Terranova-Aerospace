@@ -1022,7 +1022,7 @@ if _KSP_AVAILABLE:
 
         def run(self):
             try:
-                conn = krpc.connect(name='Orbit Visualizer', address='127.0.0.1', rpc_port=50000)
+                conn = krpc.connect(name='Terranova Software', address='127.0.0.1', rpc_port=50000)
                 self.success.emit(conn)
             except Exception as e:
                 self.failure.emit(str(e))

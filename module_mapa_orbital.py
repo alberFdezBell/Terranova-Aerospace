@@ -59,6 +59,11 @@ if _KSP_AVAILABLE:
     AXIS_HALF_LEN = 720.0
     ORBIT_LINE_COLOR = (0.0, 0.82, 0.88, 1.0)
 
+    # Colores fijos de punto según tipo de nave
+    DOT_COLOR_STATION = (0.35, 1.0, 0.0, 1.0)   # Azul  → estación espacial
+    DOT_COLOR_DEBRIS  = (1.0,  0.22, 0.22, 1.0)   # Rojo  → basura espacial
+    DOT_COLOR_SAT     = (1.0,  1.0,  1.0,  1.0)   # Blanco → satélite genérico
+
     MUN_DRAW_RADIUS = 280    # Radio visual de la Luna en el mapa (unidades km)
     MUN_COLOR       = (0.52, 0.56, 0.62, 1.0)   # Gris-azulado para la Luna
     MUN_ORBIT_COLOR = (0.35, 0.38, 0.50, 0.55)  # Órbita de la Luna (tenue)
@@ -171,6 +176,159 @@ if _KSP_AVAILABLE:
                 self._view.wheelEvent(new_event)
                 return
             super().wheelEvent(event)
+
+    class IconsOverlay(QWidget):
+        """Overlay transparente que dibuja iconos personalizados sobre las posiciones de las naves."""
+
+        def __init__(self, view_widget, visualizer, parent=None):
+            super().__init__(parent)
+            self._view = view_widget
+            self._visualizer = visualizer
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+            self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+        def paintEvent(self, event):
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+            for vid, obj in self._visualizer.render_objects.items():
+                selected = self._visualizer.selected_vessel
+                show_in_map = selected is None or selected == vid
+                if not show_in_map:
+                    continue
+
+                current = self._visualizer._hover_current.get(vid, 1.0)
+                if current <= 0.01:
+                    continue
+
+                proj = self._visualizer._project_vessel(vid)
+                if proj is None:
+                    continue
+
+                px, py, _ = proj
+
+                vessel_type = str(obj.get('vessel_type', '')).strip().lower()
+
+                icon_path = None
+                if 'station' in vessel_type or 'estacion' in vessel_type:
+                    icon_path = self._visualizer.icon_estacion_path
+                elif 'debris' in vessel_type or 'basura' in vessel_type:
+                    icon_path = self._visualizer.icon_basura_path
+                else:
+                    icon_path = self._visualizer.icon_sat_path
+
+                pixmap = None
+                if icon_path and os.path.exists(icon_path):
+                    pixmap = self._visualizer._get_cached_icon(icon_path)
+
+                if pixmap and not pixmap.isNull():
+                    current = self._visualizer._hover_current.get(vid, 1.0)
+                    painter.setOpacity(current)
+                    scale = getattr(self._visualizer, 'icon_scale', 1.0)
+                    w = int(pixmap.width() * scale)
+                    h = int(pixmap.height() * scale)
+                    painter.drawPixmap(int(px - w / 2), int(py - h / 2), w, h, pixmap)
+
+    class MapLegendWidget(QFrame):
+        """Widget de leyenda flotante interactivo para filtrar satélites por grupo."""
+
+        def __init__(self, visualizer, parent=None):
+            super().__init__(parent)
+            self._visualizer = visualizer
+
+            self.setStyleSheet("""
+                QFrame {
+                    background: rgba(13, 17, 23, 220);
+                    border: 1px solid #30363d;
+                    border-radius: 8px;
+                }
+                QLabel {
+                    border: none;
+                    background: transparent;
+                    color: #8b949e;
+                    font-size: 10px;
+                    font-weight: bold;
+                }
+            """)
+
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(10, 10, 10, 10)
+            layout.setSpacing(6)
+
+            title = QLabel("FILTRAR GRUPOS")
+            layout.addWidget(title)
+
+            self.btn_sat = QPushButton("⚪ Satélites")
+            self._setup_item_style(self.btn_sat, "#FFFFFF")
+            self.btn_sat.clicked.connect(self._toggle_sat)
+            layout.addWidget(self.btn_sat)
+
+            self.btn_station = QPushButton("🔵 Estaciones")
+            self._setup_item_style(self.btn_station, "#408df8")
+            self.btn_station.clicked.connect(self._toggle_station)
+            layout.addWidget(self.btn_station)
+
+            self.btn_debris = QPushButton("🔴 Basura")
+            self._setup_item_style(self.btn_debris, "#ff4b4b")
+            self.btn_debris.clicked.connect(self._toggle_debris)
+            layout.addWidget(self.btn_debris)
+
+        def _setup_item_style(self, btn, color_hex):
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: transparent;
+                    border: none;
+                    color: {color_hex};
+                    font-size: 11px;
+                    font-weight: bold;
+                    text-align: left;
+                    padding: 4px 6px;
+                }}
+                QPushButton:hover {{
+                    background: rgba(255, 255, 255, 15);
+                    border-radius: 4px;
+                }}
+            """)
+
+        def _toggle_sat(self):
+            self._visualizer.group_sat_enabled = not self._visualizer.group_sat_enabled
+            self._update_ui_style()
+            self._visualizer._update_selection_visuals()
+
+        def _toggle_station(self):
+            self._visualizer.group_station_enabled = not self._visualizer.group_station_enabled
+            self._update_ui_style()
+            self._visualizer._update_selection_visuals()
+
+        def _toggle_debris(self):
+            self._visualizer.group_debris_enabled = not self._visualizer.group_debris_enabled
+            self._update_ui_style()
+            self._visualizer._update_selection_visuals()
+
+        def _update_ui_style(self):
+            def apply_style(btn, color_hex, enabled):
+                color = color_hex if enabled else "#8b949e"
+                text_decor = "none" if enabled else "line-through"
+                btn.setStyleSheet(f"""
+                    QPushButton {{
+                        background: transparent;
+                        border: none;
+                        color: {color};
+                        font-size: 11px;
+                        font-weight: bold;
+                        text-align: left;
+                        padding: 4px 6px;
+                        text-decoration: {text_decor};
+                    }}
+                    QPushButton:hover {{
+                        background: rgba(255, 255, 255, 15);
+                        border-radius: 4px;
+                    }}
+                """)
+            apply_style(self.btn_sat, "#FFFFFF", self._visualizer.group_sat_enabled)
+            apply_style(self.btn_station, "#408df8", self._visualizer.group_station_enabled)
+            apply_style(self.btn_debris, "#ff4b4b", self._visualizer.group_debris_enabled)
 
     class VesselInfoCard(QFrame):
         clicked = pyqtSignal(str)
@@ -290,6 +448,19 @@ if _KSP_AVAILABLE:
             self.moon_pos_3d: tuple     = (0.0, 0.0, 0.0)
             self.moon_render: dict      = {}
             self._moon_refresh_t: float = 0.0
+            self.camera_target_body: str = 'kerbin'
+
+            # ── Iconos de satélites (Rutas, escala y cache) ───────────────────
+            self.icon_estacion_path = os.path.join(BASE_DIR, "icons", "sat", "estacion.png")
+            self.icon_basura_path = os.path.join(BASE_DIR, "icons", "sat", "basura.png")
+            self.icon_sat_path = os.path.join(BASE_DIR, "icons", "sat", "sat.png")
+            self.icon_scale = 0.5  # <--- ESCALA DE ICONOS CONFIGURABLE EN EL CÓDIGO
+            self._icon_cache = {}
+
+            # Habilitación por grupo (para filtros de leyenda)
+            self.group_sat_enabled = True
+            self.group_station_enabled = True
+            self.group_debris_enabled = True
 
             self._build_ui()
             self._init_static_scene()
@@ -539,6 +710,12 @@ if _KSP_AVAILABLE:
             self.view.mouseReleaseEvent = self._mouse_release
             self.view.wheelEvent        = self._wheel_event
 
+            self.icons_overlay = IconsOverlay(self.view, self, self.view)
+            self.icons_overlay.show()
+
+            self.legend_widget = MapLegendWidget(self, self.view)
+            self.legend_widget.show()
+
             
 
         def _make_separator(self) -> QFrame:
@@ -735,6 +912,7 @@ if _KSP_AVAILABLE:
             self.info_panel.hide()
             self._hide_info_bubble()
             self._update_selection_visuals()
+            self.camera_target_body = 'kerbin'
             self._animate_camera_to(QVector3D(0, 0, 0), 5200.0, -45.0, 22.0, duration=900)
 
         # ── Helpers del cuerpo lunar ───────────────────────────────────────────
@@ -867,6 +1045,83 @@ if _KSP_AVAILABLE:
                 sphere.resetTransform()
                 sphere.translate(mx, my, mz)
 
+        def _celestial_body_at_cursor(self, event):
+            proj_kerbin = self._project_point((0.0, 0.0, 0.0))
+            proj_moon = None
+            if self.moon_render:
+                proj_moon = self._project_point(self.moon_pos_3d)
+
+            cursor_pos = event.position()
+            best_body = None
+            best_dist = 999999.0
+
+            cam_dist = self.view.opts['distance']
+
+            if proj_kerbin is not None:
+                kx, ky, _ = proj_kerbin
+                dist_k = math.hypot(cursor_pos.x() - kx, cursor_pos.y() - ky)
+                rad_k_px = (PLANET_DRAW_RADIUS / cam_dist) * (self.view.height() / 2) * 1.5
+                rad_k_px = max(24.0, min(rad_k_px, 200.0))
+                if dist_k <= rad_k_px:
+                    best_body = 'kerbin'
+                    best_dist = dist_k
+
+            if proj_moon is not None:
+                mx, my, _ = proj_moon
+                dist_m = math.hypot(cursor_pos.x() - mx, cursor_pos.y() - my)
+                rad_m_px = (MUN_DRAW_RADIUS / cam_dist) * (self.view.height() / 2) * 1.5
+                rad_m_px = max(18.0, min(rad_m_px, 150.0))
+                if dist_m <= rad_m_px:
+                    if dist_m < best_dist:
+                        best_body = 'moon'
+                        best_dist = dist_m
+
+            return best_body
+
+        def _focus_body(self, body: str):
+            if body == 'moon' and self.moon_render:
+                self.camera_target_body = 'moon'
+                mx, my, mz = self.moon_pos_3d
+                pos = QVector3D(mx, my, mz)
+                self._animate_camera_to(pos, self.view.opts['distance'], self.view.opts['azimuth'], self.view.opts['elevation'], duration=700)
+            else:
+                self.camera_target_body = 'kerbin'
+                pos = QVector3D(0, 0, 0)
+                self._animate_camera_to(pos, self.view.opts['distance'], self.view.opts['azimuth'], self.view.opts['elevation'], duration=700)
+
+        @staticmethod
+        def _dot_color_for_type(vessel_type: str) -> tuple:
+            """Devuelve el color RGBA del punto del satélite según su tipo de nave KSP."""
+            vt = str(vessel_type or '').strip().lower()
+            if 'station' in vt:
+                return DOT_COLOR_STATION    # Azul  → estación espacial
+            if 'debris' in vt:
+                return DOT_COLOR_DEBRIS     # Rojo  → basura espacial
+            return DOT_COLOR_SAT            # Blanco → cualquier otro
+
+        def _get_cached_icon(self, path: str) -> QPixmap:
+            if path not in self._icon_cache:
+                self._icon_cache[path] = QPixmap(path)
+            return self._icon_cache[path]
+
+        def _has_icon_for_vessel(self, vessel_type: str) -> bool:
+            v_type = str(vessel_type or '').strip().lower()
+            if 'station' in v_type or 'estacion' in v_type:
+                path = self.icon_estacion_path
+            elif 'debris' in v_type or 'basura' in v_type:
+                path = self.icon_basura_path
+            else:
+                path = self.icon_sat_path
+            return bool(path and os.path.exists(path))
+
+        def _is_vessel_group_enabled(self, vessel_type: str) -> bool:
+            vt = str(vessel_type or '').strip().lower()
+            if 'station' in vt:
+                return self.group_station_enabled
+            if 'debris' in vt:
+                return self.group_debris_enabled
+            return self.group_sat_enabled
+
         def _init_static_scene(self):
             md = gl.MeshData.sphere(rows=30, cols=48, radius=PLANET_DRAW_RADIUS)
             self.planet = gl.GLMeshItem(
@@ -882,17 +1137,17 @@ if _KSP_AVAILABLE:
             self.view.addItem(self.planet)
 
             rng = np.random.default_rng(42)
-            phi   = rng.uniform(0, 2 * np.pi, 1200)
-            theta = np.arccos(rng.uniform(-1, 1, 1200))
-            dist  = rng.uniform(12000, 18000, 1200)
+            phi   = rng.uniform(0, 2 * np.pi, 1500)
+            theta = np.arccos(rng.uniform(-1, 1, 1500))
+            dist  = rng.uniform(75000, 95000, 1500)
             stars = np.column_stack([
                 dist * np.sin(theta) * np.cos(phi),
                 dist * np.sin(theta) * np.sin(phi),
                 dist * np.cos(theta)
             ]).astype(np.float32)
-            star_sizes = rng.uniform(1.0, 2.5, 1200).astype(np.float32)
-            star_colors = np.ones((1200, 4), dtype=np.float32)
-            star_colors[:, 3] = rng.uniform(0.3, 0.9, 1200).astype(np.float32)
+            star_sizes = rng.uniform(1.0, 2.5, 1500).astype(np.float32)
+            star_colors = np.ones((1500, 4), dtype=np.float32)
+            star_colors[:, 3] = rng.uniform(0.3, 0.9, 1500).astype(np.float32)
             self.stars = gl.GLScatterPlotItem(
                 pos=stars, size=star_sizes, color=star_colors, pxMode=False, glOptions='opaque'
             )
@@ -1024,6 +1279,18 @@ if _KSP_AVAILABLE:
                 if not show_in_map:
                     continue
 
+                vessel_type = str(obj.get('vessel_type', '')).strip().lower()
+                group_enabled = True
+                if 'station' in vessel_type:
+                    group_enabled = self.group_station_enabled
+                elif 'debris' in vessel_type:
+                    group_enabled = self.group_debris_enabled
+                else:
+                    group_enabled = self.group_sat_enabled
+
+                if not group_enabled:
+                    continue
+
                 projected = self._project_vessel(vid)
                 if projected is None:
                     continue
@@ -1085,7 +1352,8 @@ if _KSP_AVAILABLE:
             for vid, obj in self.render_objects.items():
                 is_selected = self.selected_vessel == vid
                 is_hovered = self.hovered_vessel == vid
-                show_in_map = self.selected_vessel is None or is_selected
+                group_enabled = self._is_vessel_group_enabled(obj.get('vessel_type', ''))
+                show_in_map = (self.selected_vessel is None or is_selected) and group_enabled
 
                 line = obj.get('line')
                 dot = obj.get('dot')
@@ -1101,14 +1369,12 @@ if _KSP_AVAILABLE:
                             highlighted_items.append(line)
 
                 if dot is not None:
-                    dot.setVisible(show_in_map)
-                    if show_in_map and (is_hovered or is_selected):
+                    has_icon = self._has_icon_for_vessel(obj.get('vessel_type', ''))
+                    dot.setVisible(show_in_map and not has_icon)
+                    if show_in_map and not has_icon and (is_hovered or is_selected):
                         highlighted_items.append(dot)
 
                 if trail is not None:
-                    # El rastro se mantiene visible mientras el satélite esté en
-                    # el mapa; su atenuación por hover se aplica de forma
-                    # progresiva en _animate_hover_alpha, no aquí.
                     trail.setVisible(show_in_map)
                     if show_in_map and (is_hovered or is_selected):
                         highlighted_items.append(trail)
@@ -1128,8 +1394,19 @@ if _KSP_AVAILABLE:
             estos objetivos ocurre en _animate_hover_alpha en cada frame."""
             has_hover = self.hovered_vessel is not None and self.selected_vessel is None
 
-            for vid in self.render_objects:
-                if has_hover:
+            for vid, obj in self.render_objects.items():
+                vessel_type = str(obj.get('vessel_type', '')).strip().lower()
+                group_enabled = True
+                if 'station' in vessel_type:
+                    group_enabled = self.group_station_enabled
+                elif 'debris' in vessel_type:
+                    group_enabled = self.group_debris_enabled
+                else:
+                    group_enabled = self.group_sat_enabled
+
+                if not group_enabled:
+                    self._hover_targets[vid] = 0.0
+                elif has_hover:
                     self._hover_targets[vid] = 1.0 if vid == self.hovered_vessel else 0.08
                 else:
                     self._hover_targets[vid] = 1.0
@@ -1162,13 +1439,16 @@ if _KSP_AVAILABLE:
                 if line is not None and base_line is not None:
                     line.setData(color=(base_line[0], base_line[1], base_line[2],
                                          base_line[3] * current))
+                    line.setVisible(current > 0.01)
 
                 # Punto (satélite)
                 dot = obj.get('dot')
                 base_dot = obj.get('base_dot_color')
                 if dot is not None and base_dot is not None:
+                    has_icon = self._has_icon_for_vessel(obj.get('vessel_type', ''))
                     dot.setData(color=(base_dot[0], base_dot[1], base_dot[2],
                                         base_dot[3] * current))
+                    dot.setVisible(current > 0.01 and not has_icon)
 
                 # Estela
                 trail = obj.get('trail_line')
@@ -1178,6 +1458,7 @@ if _KSP_AVAILABLE:
                     faded_trail = base_trail.copy()
                     faded_trail[:, 3] = base_trail[:, 3] * current
                     trail.setData(pos=ordered, color=faded_trail)
+                    trail.setVisible(current > 0.01)
 
         def _apply_filter(self, text: str):
             self.active_filter_text = (text or "").strip().lower()
@@ -1238,6 +1519,11 @@ if _KSP_AVAILABLE:
                 for vessel in vessels:
                     try:
                         vid = vessel.name
+                        try:
+                            vt_obj = getattr(vessel, 'type', None)
+                            vessel_type = str(getattr(vt_obj, 'name', vt_obj) or '').strip().lower()
+                        except Exception:
+                            vessel_type = ''
 
                         if vid not in self.vessel_streams:
                             orb = vessel.orbit
@@ -1359,7 +1645,7 @@ if _KSP_AVAILABLE:
                             cidx = self.color_counter % len(VESSEL_COLORS)
                             self.color_counter += 1
                             lc = VESSEL_COLORS[cidx]
-                            dc = DOT_COLORS[cidx]
+                            dc = self._dot_color_for_type(vessel_type)
 
                             line = gl.GLLinePlotItem(
                                 pos=rotated_w, color=ORBIT_LINE_COLOR,
@@ -1388,6 +1674,8 @@ if _KSP_AVAILABLE:
                                 glOptions='translucent'
                             )
 
+                            has_icon = self._has_icon_for_vessel(vessel_type)
+                            dot.setVisible(not has_icon)
                             self.view.addItem(line)
                             self.view.addItem(dot)
                             self.view.addItem(trail_line)
@@ -1418,6 +1706,7 @@ if _KSP_AVAILABLE:
                                 'last_update_time':  time.time(),
                                 'body_name':         _body_name,
                                 'is_lunar':          _is_lunar,
+                                'vessel_type':       vessel_type,
                             }
 
                             # Estado de fundido para el oscurecido suave por hover
@@ -1850,6 +2139,10 @@ if _KSP_AVAILABLE:
                             or not period or ta_base is None or t0 is None):
                         continue
 
+                    # Saltar completamente los satélites de grupos deshabilitados
+                    if not self._is_vessel_group_enabled(obj.get('vessel_type', '')):
+                        continue
+
                     dt = now - t0
                     true_anom = self._propagate_true_anomaly(ecc, period, ta_base, dt)
 
@@ -1891,9 +2184,22 @@ if _KSP_AVAILABLE:
             # Transición suave del oscurecido por hover
             self._animate_hover_alpha()
 
-            # Seguimiento de cámara fluido sobre el satélite seleccionado
+            # Seguimiento de cámara fluido sobre el satélite seleccionado o el cuerpo celeste enfocado
             if selected is not None and selected in self.render_objects:
                 self._focus_camera_on(selected, initial=False)
+            elif getattr(self, 'camera_target_body', 'kerbin') == 'moon' and self.moon_render:
+                mx, my, mz = self.moon_pos_3d
+                anim_running = (
+                    hasattr(self, '_camera_anim_obj') and 
+                    self._camera_anim_obj is not None and 
+                    self._camera_anim_obj.state() == QVariantAnimation.State.Running
+                )
+                if not anim_running:
+                    self.view.setCameraPosition(pos=QVector3D(mx, my, mz))
+                    self.view.update()
+            
+            if hasattr(self, 'icons_overlay') and self.icons_overlay is not None:
+                self.icons_overlay.update()
 
         def _handle_update_error(self, e):
             self.timer.stop()
@@ -1935,8 +2241,12 @@ if _KSP_AVAILABLE:
                         release_hit[0] == self._press_vessel
                     ):
                         self._select_vessel(self._press_vessel)
-                    elif is_click and self._press_vessel is None and self.selected_vessel is not None:
-                        self._deselect_vessel()
+                    elif is_click and self._press_vessel is None:
+                        celestial = self._celestial_body_at_cursor(event)
+                        if celestial is not None:
+                            self._focus_body(celestial)
+                        elif self.selected_vessel is not None:
+                            self._deselect_vessel()
                 self._press_pos = None
                 self._press_vessel = None
                 self.last_mouse_pos = None
@@ -1948,6 +2258,8 @@ if _KSP_AVAILABLE:
             new_dist = max(700, min(35000, new_dist))
             self.view.setCameraPosition(distance=new_dist)
             self.view.update()
+            if hasattr(self, 'icons_overlay') and self.icons_overlay is not None:
+                self.icons_overlay.update()
 
         def _mouse_move(self, event):
             if self.is_rotating and self.last_mouse_pos is not None:
@@ -1959,6 +2271,8 @@ if _KSP_AVAILABLE:
                 new_elev = max(-89.0, min(89.0, new_elev))
                 self.view.setCameraPosition(azimuth=new_azim, elevation=new_elev)
                 self.view.update()
+                if hasattr(self, 'icons_overlay') and self.icons_overlay is not None:
+                    self.icons_overlay.update()
                 return
 
             hit = self._vessel_at_cursor(event)
@@ -1993,10 +2307,21 @@ if _KSP_AVAILABLE:
                 self.btn_back.raise_()
 
         def _reposition_overlay(self):
+            if hasattr(self, 'icons_overlay') and self.icons_overlay is not None:
+                self.icons_overlay.setGeometry(0, 0, self.view.width(), self.view.height())
+                self.icons_overlay.raise_()
             if hasattr(self, 'overlay') and self.overlay is not None:
                 h = self.height() if self.height() > 0 else 800
                 self.overlay.setGeometry(0, 0, 260, h)
                 self.overlay.raise_()
+            if hasattr(self, 'legend_widget') and self.legend_widget is not None:
+                self.legend_widget.adjustSize()
+                lw = self.legend_widget.width()
+                lh = self.legend_widget.height()
+                self.legend_widget.setGeometry(self.view.width() - lw - 15, self.view.height() - lh - 15, lw, lh)
+                self.legend_widget.raise_()
+            if hasattr(self, 'info_bubble') and self.info_bubble is not None:
+                self.info_bubble.raise_()
 
         def _reposition_back_button(self):
             if hasattr(self, 'btn_back') and self.btn_back is not None:
