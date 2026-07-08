@@ -22,7 +22,10 @@ from core_shared import (
     krpc,
     gl,
     ConnectThread,
-    connect_to_ksp_async
+    connect_to_ksp_async,
+    LUNAR_BODY_NAMES,
+    _is_lunar_body,
+    _normalize_key,
 )
 
 if _KSP_AVAILABLE:
@@ -55,6 +58,11 @@ if _KSP_AVAILABLE:
     EQUATORIAL_RING_RADIUS = 468.0
     AXIS_HALF_LEN = 720.0
     ORBIT_LINE_COLOR = (0.0, 0.82, 0.88, 1.0)
+
+    MUN_DRAW_RADIUS = 280    # Radio visual de la Luna en el mapa (unidades km)
+    MUN_COLOR       = (0.52, 0.56, 0.62, 1.0)   # Gris-azulado para la Luna
+    MUN_ORBIT_COLOR = (0.35, 0.38, 0.50, 0.55)  # Órbita de la Luna (tenue)
+    MUN_RADIUS_KM   = 200.0  # Radio superficial de la Luna en KSP (km)
 
     class PassthroughOverlay(QWidget):
         """Overlay transparente que reenvía eventos de mouse al GLViewWidget
@@ -275,6 +283,13 @@ if _KSP_AVAILABLE:
             self.is_rotating = False
             self._press_pos = None
             self._press_vessel = None
+
+            # ── Seguimiento del cuerpo lunar ──────────────────────────────────
+            self.lunar_body_name: str   = ""
+            self.lunar_body_obj         = None
+            self.moon_pos_3d: tuple     = (0.0, 0.0, 0.0)
+            self.moon_render: dict      = {}
+            self._moon_refresh_t: float = 0.0
 
             self._build_ui()
             self._init_static_scene()
@@ -686,15 +701,22 @@ if _KSP_AVAILABLE:
                 f"<span style='color:{color_hex}'>{vessel_name}</span>"
             )
 
-            alt_km  = info.get('alt_km', 0)
-            period  = info.get('period', 0)
-            inc_rad = info.get('inc', 0)
-            ecc     = info.get('ecc', 0)
-            vel_ms  = info.get('vel_ms', 0)
+            alt_km   = info.get('alt_km', 0)
+            period   = info.get('period', 0)
+            inc_rad  = info.get('inc', 0)
+            ecc      = info.get('ecc', 0)
+            vel_ms   = info.get('vel_ms', 0)
+            body_name = info.get('body_name', '')
 
             c_key = "#6e7681"   # color etiqueta
             c_val = "#e6edf3"   # color valor
+            body_row = (
+                f"<span style='color:{c_key}'>Cuerpo</span>  "
+                f"<span style='color:{c_val}'>{body_name}</span><br>"
+                if body_name else ""
+            )
             self.info_body.setText(
+                f"{body_row}"
                 f"<span style='color:{c_key}'>Altitud</span>  "
                 f"<span style='color:{c_val}'>{alt_km:,.0f} km</span><br>"
                 f"<span style='color:{c_key}'>Período</span>  "
@@ -714,6 +736,136 @@ if _KSP_AVAILABLE:
             self._hide_info_bubble()
             self._update_selection_visuals()
             self._animate_camera_to(QVector3D(0, 0, 0), 5200.0, -45.0, 22.0, duration=900)
+
+        # ── Helpers del cuerpo lunar ───────────────────────────────────────────
+
+        def _find_lunar_body(self):
+            """Busca la Luna entre los cuerpos celestes de KSP.
+            Devuelve (nombre, objeto_body) o (None, None) si no se encuentra."""
+            if not self.conn:
+                return None, None
+            try:
+                for name, body in self.conn.space_center.bodies.items():
+                    if _is_lunar_body(name):
+                        return name, body
+            except Exception:
+                pass
+            return None, None
+
+        def _setup_moon(self, moon_name: str, moon_body) -> bool:
+            """Construye los GL items para la esfera de la Luna y su órbita alrededor de Kerbin."""
+            try:
+                orb    = moon_body.orbit
+                sma    = float(orb.semi_major_axis) / 1000.0
+                inc    = float(orb.inclination)
+                lan    = float(orb.longitude_of_ascending_node)
+                argp   = float(orb.argument_of_periapsis)
+                ecc    = float(orb.eccentricity)
+                period = float(orb.period)
+                ta     = float(orb.true_anomaly)
+
+                ci, si_ = np.cos(inc), np.sin(inc)
+                cl, sl  = np.cos(lan), np.sin(lan)
+                ca, sa  = np.cos(argp), np.sin(argp)
+                R = (np.array([[cl, -sl, 0], [sl, cl, 0], [0, 0, 1]])
+                     @ np.array([[1, 0, 0], [0, ci, -si_], [0, si_, ci]])
+                     @ np.array([[ca, -sa, 0], [sa, ca, 0], [0, 0, 1]]))
+
+                r_now = sma * (1 - ecc ** 2) / (1 + ecc * math.cos(ta))
+                pos   = R @ np.array([r_now * math.cos(ta), r_now * math.sin(ta), 0.0])
+                mx, my, mz = float(pos[0]), float(pos[1]), float(pos[2])
+
+                # Órbita de la Luna alrededor de Kerbin
+                theta_m   = np.linspace(0, 2 * np.pi, ORBIT_POINTS)
+                r_t       = sma * (1 - ecc ** 2) / (1 + ecc * np.cos(theta_m))
+                orbit_pts = (R @ np.vstack([
+                    r_t * np.cos(theta_m),
+                    r_t * np.sin(theta_m),
+                    np.zeros(ORBIT_POINTS),
+                ])).T.astype(np.float32)
+
+                moon_orbit_line = gl.GLLinePlotItem(
+                    pos=orbit_pts, color=MUN_ORBIT_COLOR,
+                    width=1.2, antialias=True, mode='line_strip', glOptions='opaque',
+                )
+
+                # Esfera de la Luna
+                md = gl.MeshData.sphere(rows=20, cols=32, radius=MUN_DRAW_RADIUS)
+                moon_sphere = gl.GLMeshItem(
+                    meshdata=md, smooth=True, color=MUN_COLOR,
+                    drawEdges=False, drawFaces=True,
+                    shader='shaded', glOptions='opaque',
+                )
+                moon_sphere.translate(mx, my, mz)
+
+                self.view.addItem(moon_orbit_line)
+                self.view.addItem(moon_sphere)
+
+                self.lunar_body_name = moon_name
+                self.lunar_body_obj  = moon_body
+                self.moon_pos_3d     = (mx, my, mz)
+                self.moon_render     = {
+                    'sphere':            moon_sphere,
+                    'orbit_line':        moon_orbit_line,
+                    'R_matrix':          R,
+                    'r_orbit':           sma,
+                    'ecc':               ecc,
+                    'period':            period,
+                    'true_anomaly_base': ta,
+                    'last_update_time':  time.time(),
+                }
+                return True
+            except Exception:
+                return False
+
+        def _remove_moon(self) -> None:
+            """Elimina los GL items de la Luna del escenario."""
+            for key in ('sphere', 'orbit_line'):
+                item = self.moon_render.get(key)
+                if item is not None:
+                    try:
+                        self.view.removeItem(item)
+                    except Exception:
+                        pass
+            self.moon_render.clear()
+            self.lunar_body_name = ""
+            self.lunar_body_obj  = None
+            self.moon_pos_3d     = (0.0, 0.0, 0.0)
+
+        def _refresh_moon_from_ksp(self) -> None:
+            """Actualiza la anomalía verdadera de la Luna leyendo el dato real de KSP."""
+            if not self.conn or not self.moon_render or self.lunar_body_obj is None:
+                return
+            try:
+                ta = float(self.lunar_body_obj.orbit.true_anomaly)
+                self.moon_render['true_anomaly_base'] = ta
+                self.moon_render['last_update_time']  = time.time()
+            except Exception:
+                pass
+
+        def _animate_moon(self) -> None:
+            """Extrapola la posición de la Luna con mecánica Kepleriana y mueve su esfera GL."""
+            mr = self.moon_render
+            if not mr:
+                return
+            R       = mr.get('R_matrix')
+            r_orbit = mr.get('r_orbit')
+            ecc     = mr.get('ecc')
+            period  = mr.get('period')
+            ta_base = mr.get('true_anomaly_base')
+            t0      = mr.get('last_update_time')
+            if R is None or r_orbit is None or ecc is None or not period or ta_base is None or t0 is None:
+                return
+            dt = time.time() - t0
+            ta = self._propagate_true_anomaly(ecc, period, ta_base, dt)
+            r  = r_orbit * (1 - ecc ** 2) / (1 + ecc * math.cos(ta))
+            pos = R @ np.array([r * math.cos(ta), r * math.sin(ta), 0.0])
+            mx, my, mz   = float(pos[0]), float(pos[1]), float(pos[2])
+            self.moon_pos_3d = (mx, my, mz)
+            sphere = mr.get('sphere')
+            if sphere is not None:
+                sphere.resetTransform()
+                sphere.translate(mx, my, mz)
 
         def _init_static_scene(self):
             md = gl.MeshData.sphere(rows=30, cols=48, radius=PLANET_DRAW_RADIUS)
@@ -756,6 +908,10 @@ if _KSP_AVAILABLE:
         def _on_connected(self, conn):
             self.conn = conn
             self._camera_fitted = False
+            # Detectar y renderizar el cuerpo lunar del sistema solar activo
+            moon_n, moon_b = self._find_lunar_body()
+            if moon_n and not self.moon_render:
+                self._setup_moon(moon_n, moon_b)
             self._reload_data()
             self.timer.start(300)
             self.animation_timer.start(30)
@@ -807,6 +963,8 @@ if _KSP_AVAILABLE:
             if hasattr(self, 'info_panel'):
                 self.info_panel.hide()
             self._hide_info_bubble()
+            # Eliminar luna
+            self._remove_moon()
 
         def _on_back_clicked(self):
             self.timer.stop()
@@ -1118,13 +1276,24 @@ if _KSP_AVAILABLE:
 
                         active_vids.add(vid)
 
+                        # ── Detección del cuerpo orbitado ──────────────────────
+                        try:
+                            _body_name = str(getattr(vessel.orbit.body, 'name', '') or '').strip()
+                        except Exception:
+                            _body_name = ''
+                        _is_lunar = _is_lunar_body(_body_name)
+                        if _is_lunar and not self.moon_render:
+                            _mn, _mb = self._find_lunar_body()
+                            if _mn:
+                                self._setup_moon(_mn, _mb)
+
                         inc = streams['inc']()
                         lan = streams['lan']()
                         argp = streams['argp']()
                         ecc = streams['ecc']()
                         period = streams['period']()
                         r_orbit = sma / 1000.0
-                        max_orbit_radius = max(max_orbit_radius, r_orbit * (1.0 + ecc))
+                        # max_orbit_radius se actualiza abajo tras el offset lunar
 
                         if ecc < 0.999:
                             r_theta = r_orbit * (1 - ecc**2) / (1 + ecc * cos_t)
@@ -1154,7 +1323,20 @@ if _KSP_AVAILABLE:
                         pos_now = (R @ np.array([x_now, y_now, 0.0]))
                         sx, sy, sz = float(pos_now[0]), float(pos_now[1]), float(pos_now[2])
 
-                        alt_km = r_now - KERBIN_RADIUS_KM
+                        # ── Offset lunar y altitud ─────────────────────────────
+                        if _is_lunar:
+                            mx, my, mz = self.moon_pos_3d
+                            _off      = np.array([mx, my, mz], dtype=np.float32)
+                            rotated_w = rotated + _off
+                            sx_w, sy_w, sz_w = sx + mx, sy + my, sz + mz
+                            _moon_r   = math.hypot(math.hypot(mx, my), mz)
+                            max_orbit_radius = max(max_orbit_radius, _moon_r + r_orbit * (1.0 + ecc))
+                            alt_km    = r_now - MUN_RADIUS_KM
+                        else:
+                            rotated_w = rotated
+                            sx_w, sy_w, sz_w = sx, sy, sz
+                            max_orbit_radius = max(max_orbit_radius, r_orbit * (1.0 + ecc))
+                            alt_km    = r_now - KERBIN_RADIUS_KM
 
                         vel_ms = 0.0
                         try:
@@ -1164,11 +1346,13 @@ if _KSP_AVAILABLE:
                             pass
 
                         info_data = {
-                            'alt_km': alt_km,
-                            'period': period,
-                            'inc': inc,
-                            'ecc': ecc,
-                            'vel_ms': vel_ms,
+                            'alt_km':    alt_km,
+                            'period':    period,
+                            'inc':       inc,
+                            'ecc':       ecc,
+                            'vel_ms':    vel_ms,
+                            'body_name': _body_name,
+                            'is_lunar':  _is_lunar,
                         }
 
                         if vid not in self.render_objects:
@@ -1178,19 +1362,19 @@ if _KSP_AVAILABLE:
                             dc = DOT_COLORS[cidx]
 
                             line = gl.GLLinePlotItem(
-                                pos=rotated, color=ORBIT_LINE_COLOR,
+                                pos=rotated_w, color=ORBIT_LINE_COLOR,
                                 width=1.5, antialias=True, mode='line_strip',
                                 glOptions='opaque'
                             )
                             dot = gl.GLScatterPlotItem(
-                                pos=np.array([[sx, sy, sz]], dtype=np.float32),
+                                pos=np.array([[sx_w, sy_w, sz_w]], dtype=np.float32),
                                 color=dc, size=8, pxMode=True, glOptions='opaque'
                             )
 
                             trail_buf = np.empty((TRAIL_LEN, 3), dtype=np.float32)
-                            trail_buf[:, 0] = sx
-                            trail_buf[:, 1] = sy
-                            trail_buf[:, 2] = sz
+                            trail_buf[:, 0] = sx_w
+                            trail_buf[:, 1] = sy_w
+                            trail_buf[:, 2] = sz_w
 
                             trail_alphas = np.linspace(0.0, 1.0, TRAIL_LEN)
                             trail_colors = np.zeros((TRAIL_LEN, 4), dtype=np.float32)
@@ -1209,27 +1393,31 @@ if _KSP_AVAILABLE:
                             self.view.addItem(trail_line)
 
                             self.render_objects[vid] = {
-                                'line': line,
-                                'orbit_pts': rotated,
-                                'dot': dot,
-                                'trail_line': trail_line,
-                                'trail_buf': trail_buf,
-                                'trail_head': 0,
-                                'trail_filled': False,
-                                'trail_colors': trail_colors,
+                                'line':              line,
+                                'orbit_pts':         rotated_w,
+                                'orbit_pts_local':   rotated,
+                                'dot':               dot,
+                                'trail_line':        trail_line,
+                                'trail_buf':         trail_buf,
+                                'trail_head':        0,
+                                'trail_filled':      False,
+                                'trail_colors':      trail_colors,
                                 'base_trail_colors': trail_colors.copy(),
-                                'base_line_color': ORBIT_LINE_COLOR,
-                                'base_dot_color': dc,
-                                'pos_3d': (sx, sy, sz),
-                                'info_data': info_data,
-                                'color_idx': cidx,
-                                'ordered_trail': trail_buf.copy(),
-                                'R_matrix': R,
-                                'r_orbit': r_orbit,
-                                'ecc': ecc,
-                                'period': period,
+                                'base_line_color':   ORBIT_LINE_COLOR,
+                                'base_dot_color':    dc,
+                                'pos_3d':            (sx_w, sy_w, sz_w),
+                                'pos_3d_local':      (sx, sy, sz),
+                                'info_data':         info_data,
+                                'color_idx':         cidx,
+                                'ordered_trail':     trail_buf.copy(),
+                                'R_matrix':          R,
+                                'r_orbit':           r_orbit,
+                                'ecc':               ecc,
+                                'period':            period,
                                 'true_anomaly_base': true_anom,
-                                'last_update_time': time.time(),
+                                'last_update_time':  time.time(),
+                                'body_name':         _body_name,
+                                'is_lunar':          _is_lunar,
                             }
 
                             # Estado de fundido para el oscurecido suave por hover
@@ -1247,20 +1435,29 @@ if _KSP_AVAILABLE:
                                     0.0
                                 ]))
                                 sx, sy, sz = float(pos_now2[0]), float(pos_now2[1]), float(pos_now2[2])
+                                if _is_lunar:
+                                    mx, my, mz = self.moon_pos_3d
+                                    sx_w, sy_w, sz_w = sx + mx, sy + my, sz + mz
+                                else:
+                                    sx_w, sy_w, sz_w = sx, sy, sz
 
-                            obj['orbit_pts'] = rotated
-                            obj['pos_3d'] = (sx, sy, sz)
-                            obj['info_data'] = info_data
-                            obj['R_matrix'] = R
-                            obj['r_orbit'] = r_orbit
-                            obj['ecc'] = ecc
-                            obj['period'] = period
+                            obj['orbit_pts']         = rotated_w
+                            obj['orbit_pts_local']   = rotated
+                            obj['pos_3d']            = (sx_w, sy_w, sz_w)
+                            obj['pos_3d_local']      = (sx, sy, sz)
+                            obj['info_data']         = info_data
+                            obj['R_matrix']          = R
+                            obj['r_orbit']           = r_orbit
+                            obj['ecc']               = ecc
+                            obj['period']            = period
                             obj['true_anomaly_base'] = resolved_anom
-                            obj['last_update_time'] = now_t
+                            obj['last_update_time']  = now_t
+                            obj['body_name']         = _body_name
+                            obj['is_lunar']          = _is_lunar
 
                             buf = obj['trail_buf']
                             head = obj['trail_head']
-                            buf[head] = [sx, sy, sz]
+                            buf[head] = [sx_w, sy_w, sz_w]
                             obj['trail_head'] = (head + 1) % TRAIL_LEN
                             if not obj['trail_filled'] and head == TRAIL_LEN - 1:
                                 obj['trail_filled'] = True
@@ -1303,7 +1500,11 @@ if _KSP_AVAILABLE:
                             del self.vessel_streams[vid]
 
                 if not self._camera_fitted and active_vids:
-                    target_distance = max(5200.0, max_orbit_radius * 1.5)
+                    # Incluir la órbita de la Luna en el radio máximo para el encuadre inicial
+                    if self.moon_render:
+                        moon_sma = self.moon_render.get('r_orbit', 0)
+                        max_orbit_radius = max(max_orbit_radius, moon_sma * 1.15)
+                    target_distance = max(5200.0, max_orbit_radius * 2.2)
                     self.view.setCameraPosition(distance=target_distance)
                     self._camera_fitted = True
 
@@ -1401,6 +1602,12 @@ if _KSP_AVAILABLE:
                 if not self.vessels_to_update:
                     return
 
+                # ── Refrescar posición de la Luna desde KSP periódicamente ───────
+                _now_pre = time.time()
+                if _now_pre - self._moon_refresh_t > 2.0:
+                    self._refresh_moon_from_ksp()
+                    self._moon_refresh_t = _now_pre
+
                 # Actualizar el siguiente satélite
                 vessel = self.vessels_to_update[self.current_vessel_index]
                 self.current_vessel_index += 1
@@ -1408,6 +1615,13 @@ if _KSP_AVAILABLE:
                 vid = vessel.name
                 if vid not in self.vessel_streams or vid not in self.render_objects:
                     return
+
+                # ── Detección del cuerpo orbitado ──────────────────────
+                try:
+                    _body_name = str(getattr(vessel.orbit.body, 'name', '') or '').strip()
+                except Exception:
+                    _body_name = self.render_objects[vid].get('body_name', '')
+                _is_lunar = _is_lunar_body(_body_name)
 
                 streams = self.vessel_streams[vid]
                 sma = streams['sma']()
@@ -1450,7 +1664,17 @@ if _KSP_AVAILABLE:
                 pos_now = (R @ np.array([x_now, y_now, 0.0]))
                 sx, sy, sz = float(pos_now[0]), float(pos_now[1]), float(pos_now[2])
 
-                alt_km = r_now - KERBIN_RADIUS_KM
+                # ── Offset lunar ────────────────────────────────────
+                if _is_lunar:
+                    mx, my, mz = self.moon_pos_3d
+                    _off      = np.array([mx, my, mz], dtype=np.float32)
+                    rotated_w = rotated + _off
+                    sx_w, sy_w, sz_w = sx + mx, sy + my, sz + mz
+                    alt_km    = r_now - MUN_RADIUS_KM
+                else:
+                    rotated_w = rotated
+                    sx_w, sy_w, sz_w = sx, sy, sz
+                    alt_km    = r_now - KERBIN_RADIUS_KM
 
                 vel_ms = 0.0
                 try:
@@ -1460,11 +1684,13 @@ if _KSP_AVAILABLE:
                     pass
 
                 info_data = {
-                    'alt_km': alt_km,
-                    'period': period,
-                    'inc': inc,
-                    'ecc': ecc,
-                    'vel_ms': vel_ms,
+                    'alt_km':    alt_km,
+                    'period':    period,
+                    'inc':       inc,
+                    'ecc':       ecc,
+                    'vel_ms':    vel_ms,
+                    'body_name': _body_name,
+                    'is_lunar':  _is_lunar,
                 }
 
                 obj = self.render_objects[vid]
@@ -1478,20 +1704,29 @@ if _KSP_AVAILABLE:
                         0.0
                     ]))
                     sx, sy, sz = float(pos_now2[0]), float(pos_now2[1]), float(pos_now2[2])
+                    if _is_lunar:
+                        mx, my, mz = self.moon_pos_3d
+                        sx_w, sy_w, sz_w = sx + mx, sy + my, sz + mz
+                    else:
+                        sx_w, sy_w, sz_w = sx, sy, sz
 
-                obj['orbit_pts'] = rotated
-                obj['pos_3d'] = (sx, sy, sz)
-                obj['info_data'] = info_data
-                obj['R_matrix'] = R
-                obj['r_orbit'] = r_orbit
-                obj['ecc'] = ecc
-                obj['period'] = period
+                obj['orbit_pts']         = rotated_w
+                obj['orbit_pts_local']   = rotated
+                obj['pos_3d']            = (sx_w, sy_w, sz_w)
+                obj['pos_3d_local']      = (sx, sy, sz)
+                obj['info_data']         = info_data
+                obj['R_matrix']          = R
+                obj['r_orbit']           = r_orbit
+                obj['ecc']               = ecc
+                obj['period']            = period
                 obj['true_anomaly_base'] = resolved_anom
-                obj['last_update_time'] = now_t
+                obj['last_update_time']  = now_t
+                obj['body_name']         = _body_name
+                obj['is_lunar']          = _is_lunar
 
-                buf = obj['trail_buf']
+                buf  = obj['trail_buf']
                 head = obj['trail_head']
-                buf[head] = [sx, sy, sz]
+                buf[head] = [sx_w, sy_w, sz_w]
                 obj['trail_head'] = (head + 1) % TRAIL_LEN
                 if not obj['trail_filled'] and head == TRAIL_LEN - 1:
                     obj['trail_filled'] = True
@@ -1599,6 +1834,9 @@ if _KSP_AVAILABLE:
             now = time.time()
             selected = self.selected_vessel
 
+            # Animar la Luna primero para tener su posición actualizada
+            self._animate_moon()
+
             for vid, obj in self.render_objects.items():
                 try:
                     R = obj.get('R_matrix')
@@ -1621,12 +1859,31 @@ if _KSP_AVAILABLE:
                     pos_now = R @ np.array([x_now, y_now, 0.0])
                     sx, sy, sz = float(pos_now[0]), float(pos_now[1]), float(pos_now[2])
 
-                    obj['pos_3d'] = (sx, sy, sz)
+                    # Aplicar offset lunar si procede
+                    is_lunar = obj.get('is_lunar', False)
+                    if is_lunar:
+                        mx, my, mz = self.moon_pos_3d
+                        sx_w, sy_w, sz_w = sx + mx, sy + my, sz + mz
+                        # Actualizar órbita lunar con el offset actualizado de la Luna
+                        orbit_local = obj.get('orbit_pts_local')
+                        if orbit_local is not None:
+                            _off = np.array([mx, my, mz], dtype=np.float32)
+                            orbit_world = orbit_local + _off
+                            obj['orbit_pts'] = orbit_world
+                            show_in_map = selected is None or selected == vid
+                            line = obj.get('line')
+                            if line is not None and show_in_map:
+                                line.setData(pos=orbit_world)
+                    else:
+                        sx_w, sy_w, sz_w = sx, sy, sz
+
+                    obj['pos_3d']       = (sx_w, sy_w, sz_w)
+                    obj['pos_3d_local'] = (sx, sy, sz)
 
                     show_in_map = selected is None or selected == vid
                     dot = obj.get('dot')
                     if dot is not None and show_in_map:
-                        dot.setData(pos=np.array([[sx, sy, sz]], dtype=np.float32))
+                        dot.setData(pos=np.array([[sx_w, sy_w, sz_w]], dtype=np.float32))
 
                 except Exception:
                     continue
@@ -1688,7 +1945,7 @@ if _KSP_AVAILABLE:
             delta = event.angleDelta().y()
             factor = 0.9 if delta > 0 else 1.1
             new_dist = self.view.opts['distance'] * factor
-            new_dist = max(700, min(8000, new_dist))
+            new_dist = max(700, min(35000, new_dist))
             self.view.setCameraPosition(distance=new_dist)
             self.view.update()
 

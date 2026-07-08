@@ -187,7 +187,26 @@ DEFAULT_SATELLITE_GROUPS = {
         "max_alt_km": None,
         "system": True,
     },
+    "SATÉLITES LUNARES": {
+        "name": "SATÉLITES LUNARES",
+        "full_name": "Satélites Lunares",
+        "description": "Satélites que orbitan la Luna",
+        "min_alt_km": None,
+        "max_alt_km": None,
+        "system": True,
+    },
 }
+
+SATELLITE_GROUP_LUNAR = "SATÉLITES LUNARES"
+
+# Nombres (normalizados en minúsculas) que identifican a la Luna como cuerpo
+# orbitado. Cubre KSP estándar ("Mun"), Real Solar System ("Moon") y guardados
+# traducidos ("Luna"). Añade aquí otras variantes si tu partida usa otro nombre.
+LUNAR_BODY_NAMES = {"mun", "moon", "luna"}
+
+
+def _is_lunar_body(body_name: str) -> bool:
+    return _normalize_key(str(body_name or "")) in LUNAR_BODY_NAMES
 
 
 def apply_shadow(widget: QWidget, blur: int = 28, alpha: int = 90) -> None:
@@ -1401,6 +1420,11 @@ class SatelliteStore:
             return ["BASURA ESPACIAL"]
         return []
 
+    def _groups_for_orbit_body(self, body_name: str) -> list[str]:
+        if _is_lunar_body(body_name):
+            return [SATELLITE_GROUP_LUNAR]
+        return []
+
     def _default_game_payload(self, game_uid: str, save_name: str = "", save_path: str = "", install_root: str = "") -> dict:
         return {
             "game_uid": game_uid,
@@ -1514,8 +1538,15 @@ class SatelliteStore:
             record.setdefault("launch_ut", None)
             record.setdefault("launch_date", _format_ksp_ut(record.get("launch_ut")))
 
+            _orbit_body = orbit.get("body", "")
+            _lunar_grp  = self._groups_for_orbit_body(_orbit_body)
             if not groups_auto:
                 groups_auto = [_auto_group_for_altitude(float(orbit.get("apoapsis_km", 0) or 0))]
+                groups_auto += _lunar_grp
+            else:
+                # Re-evaluar siempre el grupo lunar aunque groups_auto ya esté poblado
+                groups_auto = [g for g in groups_auto if g != SATELLITE_GROUP_LUNAR]
+                groups_auto += _lunar_grp
             if not groups_manual and legacy_group and legacy_group not in DEFAULT_SATELLITE_GROUPS:
                 groups_manual = [legacy_group]
             elif not groups_manual and legacy_group and legacy_group in DEFAULT_SATELLITE_GROUPS and not record.get("group_manual", False):
@@ -1635,12 +1666,15 @@ class SatelliteStore:
                 name = str(getattr(vessel, "name", "")).strip()
                 vessel_type_obj = getattr(vessel, "type", None)
                 vessel_type_name = str(getattr(vessel_type_obj, "name", vessel_type_obj) or "").strip().lower()
+                body_obj = getattr(orbit, "body", None)
+                body_name = str(getattr(body_obj, "name", "") or "").strip()
                 orbit_payload = {
                     "periapsis_km": round(periapsis_km, 3),
                     "apoapsis_km": round(apoapsis_km, 3),
                     "inclination_deg": round(math.degrees(float(getattr(orbit, "inclination", 0.0) or 0.0)), 6),
                     "period_s": round(float(getattr(orbit, "period", 0.0) or 0.0), 3),
                     "eccentricity": round(float(getattr(orbit, "eccentricity", 0.0) or 0.0), 6),
+                    "body": body_name,
                 }
                 snapshots.append({
                     "name": name,
@@ -1649,6 +1683,7 @@ class SatelliteStore:
                     "inclination_deg": orbit_payload["inclination_deg"],
                     "period_s": orbit_payload["period_s"],
                     "eccentricity": orbit_payload["eccentricity"],
+                    "body": body_name,
                     "launch_ut": launch_ut,
                     "vessel_type": vessel_type_name,
                     "identity_key": self._satellite_key(name, launch_ut, orbit_payload),
@@ -1774,6 +1809,7 @@ class SatelliteStore:
             default_groups = self._unique_groups([
                 _auto_group_for_altitude(altitude_for_group),
                 *self._groups_for_vessel_type(sat.get("vessel_type", "")),
+                *self._groups_for_orbit_body(sat.get("body", "")),
             ])
             launch_ut = sat.get("launch_ut")
             if launch_ut is None:
@@ -1824,6 +1860,7 @@ class SatelliteStore:
                 "inclination_deg": sat["inclination_deg"],
                 "period_s": sat["period_s"],
                 "eccentricity": sat["eccentricity"],
+                "body": sat.get("body", ""),
             }
             if record.get("orbit") != orbit_payload:
                 record["orbit"] = orbit_payload
