@@ -83,6 +83,11 @@ CONFIG_DIR = BASE_DIR / "config"
 USER_FILE = CONFIG_DIR / "user.dat"
 PANEL_IMAGE_DIR = BASE_DIR / "icons" / "panel"
 
+# ─── Configuración de conexión kRPC ───────────────────────────────────────────
+CONFIG_FILE = CONFIG_DIR / "config.json"
+DEFAULT_KRPC_IP = "127.0.0.1"
+DEFAULT_KRPC_PORT = 50000
+
 HASH_ITERATIONS = 240_000
 
 MODULES: dict[str, str | None] = {
@@ -333,6 +338,120 @@ class AuthManager:
     @staticmethod
     def _hash_password(password: str, salt: bytes, iterations: int) -> bytes:
         return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+
+
+class KrpcConfigManager:
+    """Persistence layer for the kRPC IP address and port used across the app.
+
+    The values are stored in config/config.json and default to 127.0.0.1:50000
+    when the file doesn't exist yet or contains invalid data.
+    """
+
+    def __init__(self, config_file: Path = CONFIG_FILE):
+        self.config_file = config_file
+
+    def load(self) -> dict:
+        payload = _load_json_file(self.config_file, {})
+        if not isinstance(payload, dict):
+            payload = {}
+
+        ip = str(payload.get("krpc_ip") or "").strip() or DEFAULT_KRPC_IP
+
+        try:
+            port = int(payload.get("krpc_port", DEFAULT_KRPC_PORT))
+            if not (1 <= port <= 65535):
+                raise ValueError
+        except (TypeError, ValueError):
+            port = DEFAULT_KRPC_PORT
+
+        return {"krpc_ip": ip, "krpc_port": port}
+
+    def get_ip(self) -> str:
+        return self.load()["krpc_ip"]
+
+    def get_port(self) -> int:
+        return self.load()["krpc_port"]
+
+    def save(self, krpc_ip: str, krpc_port: int) -> None:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        payload = _load_json_file(self.config_file, {})
+        if not isinstance(payload, dict):
+            payload = {}
+        payload["krpc_ip"] = str(krpc_ip).strip() or DEFAULT_KRPC_IP
+        try:
+            port = int(krpc_port)
+        except (TypeError, ValueError):
+            port = DEFAULT_KRPC_PORT
+        payload["krpc_port"] = max(1, min(65535, port))
+        _save_json_file(self.config_file, payload)
+
+
+class KrpcSettingsDialog(QDialog):
+    """Modal dialog (accessible from the login screen's gear icon) to edit
+    the kRPC IP address and port used for every connection to KSP."""
+
+    def __init__(self, config_manager: "KrpcConfigManager | None" = None, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.config_manager = config_manager or KrpcConfigManager()
+        self.setWindowTitle("Configuración de kRPC")
+        self.setModal(True)
+        self.setMinimumWidth(380)
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(26, 24, 26, 22)
+        layout.setSpacing(12)
+
+        title = QLabel("Conexión con kRPC")
+        title.setObjectName("title")
+        layout.addWidget(title)
+
+        subtitle = QLabel("Dirección IP y puerto que usará todo el programa para conectar con el servidor kRPC de KSP.")
+        subtitle.setWordWrap(True)
+        subtitle.setObjectName("muted")
+        layout.addWidget(subtitle)
+
+        ip_label = QLabel("IP de kRPC")
+        layout.addWidget(ip_label)
+        self.ip_input = QLineEdit()
+        self.ip_input.setPlaceholderText(DEFAULT_KRPC_IP)
+        layout.addWidget(self.ip_input)
+
+        port_label = QLabel("Puerto de kRPC")
+        layout.addWidget(port_label)
+        self.port_input = QSpinBox()
+        self.port_input.setRange(1, 65535)
+        self.port_input.setValue(DEFAULT_KRPC_PORT)
+        layout.addWidget(self.port_input)
+
+        self.error_label = QLabel("")
+        self.error_label.setObjectName("error")
+        self.error_label.setWordWrap(True)
+        layout.addWidget(self.error_label)
+
+        current = self.config_manager.load()
+        self.ip_input.setText(current["krpc_ip"])
+        self.port_input.setValue(current["krpc_port"])
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText("Guardar")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Cancelar")
+        buttons.accepted.connect(self._on_save)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _on_save(self) -> None:
+        ip = self.ip_input.text().strip() or DEFAULT_KRPC_IP
+        port = self.port_input.value()
+        try:
+            self.config_manager.save(ip, port)
+        except OSError as exc:
+            self.error_label.setText(f"No se pudo guardar la configuración: {exc}")
+            return
+        self.accept()
 
 
 class LogoLabel(QLabel):
@@ -1020,15 +1139,24 @@ if _KSP_AVAILABLE:
         success = pyqtSignal(object)
         failure = pyqtSignal(str)
 
+        def __init__(self, address: str = DEFAULT_KRPC_IP, rpc_port: int = DEFAULT_KRPC_PORT, parent=None):
+            super().__init__(parent)
+            self.address = address
+            self.rpc_port = rpc_port
+
         def run(self):
             try:
-                conn = krpc.connect(name='Terranova Software', address='127.0.0.1', rpc_port=50000)
+                conn = krpc.connect(name='Terranova Software', address=self.address, rpc_port=self.rpc_port)
                 self.success.emit(conn)
             except Exception as e:
                 self.failure.emit(str(e))
 
-    def connect_to_ksp_async(on_success, on_failure):
-        thread = ConnectThread()
+    def connect_to_ksp_async(on_success, on_failure, address: str | None = None, rpc_port: int | None = None):
+        config = KrpcConfigManager().load()
+        thread = ConnectThread(
+            address=address or config["krpc_ip"],
+            rpc_port=rpc_port if rpc_port is not None else config["krpc_port"],
+        )
         thread.success.connect(on_success)
         thread.failure.connect(on_failure)
         thread.start()
@@ -1037,7 +1165,7 @@ else:
     class ConnectThread(QThread):  # type: ignore
         pass
 
-    def connect_to_ksp_async(on_success, on_failure):  # type: ignore
+    def connect_to_ksp_async(on_success, on_failure, address: str | None = None, rpc_port: int | None = None):  # type: ignore
         return None
 
 

@@ -11,11 +11,11 @@ import sys
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer, QSize
-from PyQt6.QtGui import QIcon, QPixmap
+from PyQt6.QtGui import QIcon, QPixmap, QIntValidator
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QLabel, QLineEdit, QPushButton, QVBoxLayout,
     QHBoxLayout, QScrollArea, QFrame, QGridLayout, QStackedWidget, QMainWindow,
-    QMessageBox
+    QMessageBox, QToolButton
 )
 
 # Shared core imports
@@ -29,12 +29,16 @@ from core_shared import (
     MODULE_PANEL_IMAGES,
     INITIAL_STATUS,
     MODULE_STATUS,
+    DEFAULT_KRPC_IP,
+    DEFAULT_KRPC_PORT,
     _KSP_AVAILABLE,
     _active_ksp_save_context,
     connect_to_ksp_async,
     fade_in,
     fade_out,
     AuthManager,
+    KrpcConfigManager,
+    KrpcSettingsDialog,
     LogoLabel,
     SpinnerWidget,
     GlassPanel,
@@ -56,6 +60,7 @@ class LoginScreen(QWidget):
     def __init__(self, auth: AuthManager, on_success, parent: QWidget | None = None):
         super().__init__(parent)
         self.auth = auth
+        self.krpc_config = KrpcConfigManager()
         self.on_success = on_success
         self.is_first_run = not auth.has_user()
         self._build_ui()
@@ -72,6 +77,19 @@ class LoginScreen(QWidget):
         panel_layout = QVBoxLayout(self.panel)
         panel_layout.setContentsMargins(42, 38, 42, 38)
         panel_layout.setSpacing(18)
+
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
+        header_row.addStretch(1)
+        self.settings_button = QToolButton()
+        self.settings_button.setObjectName("krpcSettingsButton")
+        self.settings_button.setText("⚙")
+        self.settings_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.settings_button.setToolTip("Configurar IP y puerto de kRPC")
+        self.settings_button.setFixedSize(34, 34)
+        self.settings_button.clicked.connect(self._open_krpc_settings)
+        header_row.addWidget(self.settings_button)
+        panel_layout.addLayout(header_row)
 
         panel_layout.addWidget(LogoLabel(QSize(270, 130)))
 
@@ -101,6 +119,22 @@ class LoginScreen(QWidget):
         self.password_input.returnPressed.connect(self.submit)
         panel_layout.addWidget(self.password_input)
 
+        self.krpc_ip_input = QLineEdit()
+        self.krpc_ip_input.setPlaceholderText(f"IP de kRPC (por defecto {DEFAULT_KRPC_IP})")
+        self.krpc_ip_input.setVisible(self.is_first_run)
+        panel_layout.addWidget(self.krpc_ip_input)
+
+        self.krpc_port_input = QLineEdit()
+        self.krpc_port_input.setPlaceholderText(f"Puerto de kRPC (por defecto {DEFAULT_KRPC_PORT})")
+        self.krpc_port_input.setValidator(QIntValidator(1, 65535, self))
+        self.krpc_port_input.setVisible(self.is_first_run)
+        panel_layout.addWidget(self.krpc_port_input)
+
+        if self.is_first_run:
+            current_krpc = self.krpc_config.load()
+            self.krpc_ip_input.setText(current_krpc["krpc_ip"])
+            self.krpc_port_input.setText(str(current_krpc["krpc_port"]))
+
         self.error_label = QLabel("")
         self.error_label.setObjectName("error")
         self.error_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -120,8 +154,20 @@ class LoginScreen(QWidget):
             if len(username) < 3 or len(password) < 6:
                 self._set_error("Usuario mínimo 3 caracteres y contraseña mínimo 6.")
                 return
+
+            krpc_ip = self.krpc_ip_input.text().strip() or DEFAULT_KRPC_IP
+            krpc_port_text = self.krpc_port_input.text().strip() or str(DEFAULT_KRPC_PORT)
+            try:
+                krpc_port = int(krpc_port_text)
+                if not (1 <= krpc_port <= 65535):
+                    raise ValueError
+            except ValueError:
+                self._set_error("El puerto de kRPC debe ser un número entre 1 y 65535.")
+                return
+
             try:
                 self.auth.create_user(username, password)
+                self.krpc_config.save(krpc_ip, krpc_port)
             except OSError as exc:
                 self._set_error(f"No se pudo guardar la configuración: {exc}")
                 return
@@ -132,6 +178,10 @@ class LoginScreen(QWidget):
             self.on_success()
         else:
             self._set_error("Credenciales no válidas.")
+
+    def _open_krpc_settings(self) -> None:
+        dialog = KrpcSettingsDialog(self.krpc_config, self)
+        dialog.exec()
 
     def _set_error(self, message: str) -> None:
         self.error_label.setText(message)
@@ -703,6 +753,23 @@ def build_stylesheet() -> str:
     QPushButton#reloadButton:hover {
         background: #2585aa;
         border-color: #9ee4f5;
+    }
+    QToolButton#krpcSettingsButton {
+        background: rgba(13, 28, 43, 200);
+        color: #9fc7dc;
+        border: 1px solid rgba(126, 164, 196, 90);
+        border-radius: 17px;
+        font-size: 16px;
+        font-weight: 700;
+    }
+    QToolButton#krpcSettingsButton:hover {
+        background: rgba(23, 45, 65, 240);
+        border-color: rgba(137, 213, 241, 220);
+        color: #ffffff;
+    }
+    QToolButton#krpcSettingsButton:pressed {
+        background: rgba(32, 58, 80, 250);
+        border-color: rgba(163, 230, 248, 235);
     }
     QWidget#moduleCard,
     QWidget#moduleCardDisabled {
