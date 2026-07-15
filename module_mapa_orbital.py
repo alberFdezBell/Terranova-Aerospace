@@ -13,7 +13,7 @@ from pathlib import Path
 from PyQt6.QtCore import pyqtSignal, QTimer, Qt, QRect, QEasingCurve, QPropertyAnimation, QPointF
 from PyQt6.QtGui import QMouseEvent, QWheelEvent, QPainter, QPen, QColor, QPixmap, QFont, QFontMetrics, QVector3D
 from PyQt6.QtWidgets import QWidget, QLabel, QVBoxLayout, QLineEdit, QPushButton, QFrame, QScrollArea, QLayout, QMessageBox
-from PySide6.QtCore import QVariantAnimation
+from PyQt6.QtCore import QVariantAnimation
 
 from core_shared import (
     BASE_DIR,

@@ -3,6 +3,7 @@ Main entry point for Terranova Aerospace.
 Handles authentication, loading, main navigation (Command Center), and internal modules.
 """
 
+
 from __future__ import annotations
 
 import random
@@ -54,7 +55,6 @@ from module_lista_satelites import SatelliteListScreen
 from module_programacion import ProgramacionScreen
 from module_centro_mando import CentroMandoScreen
 from module_personal import PersonalScreen
-
 
 class LoginScreen(QWidget):
     def __init__(self, auth: AuthManager, on_success, parent: QWidget | None = None):
@@ -477,7 +477,7 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.programacion)
         self.programacion.back_clicked.connect(self.show_command_center)
 
-        self.centro_mando = CentroMandoScreen()
+        self.centro_mando = CentroMandoScreen(conn=self._ksp_conn)
         self.stack.addWidget(self.centro_mando)
         self.centro_mando.back_clicked.connect(self.show_command_center)
 
@@ -492,6 +492,8 @@ class MainWindow(QMainWindow):
             self.visualizer.set_connection(conn)
         if self.satellite_list is not None:
             self.satellite_list.set_connection(conn)
+        if self.centro_mando is not None:
+            self.centro_mando.set_connection(conn)
 
     def _on_ksp_failed(self, err: str) -> None:
         self._ksp_conn = None
@@ -618,6 +620,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Programación iniciada", 5000)
 
     def _launch_centro_mando(self) -> None:
+        if self._ksp_conn is not None:
+            self.centro_mando.set_connection(self._ksp_conn)
         self.stack.setCurrentWidget(self.centro_mando)
         fade_in(self.centro_mando, 650)
         self.statusBar().showMessage("Centro de mando iniciado", 5000)

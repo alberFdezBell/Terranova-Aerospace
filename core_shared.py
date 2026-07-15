@@ -26,7 +26,8 @@ from pathlib import Path
 
 from PyQt6.QtCore import (
     QEasingCurve, QPropertyAnimation, QRect, QRectF, QSize, Qt, QTimer, QThread,
-    pyqtSignal, pyqtProperty, QDate, QPoint, QPointF, QEvent, QByteArray, QBuffer
+    pyqtSignal, pyqtProperty, QDate, QPoint, QPointF, QEvent, QByteArray, QBuffer,
+    QVariantAnimation
 )
 from PyQt6.QtGui import (
     QMouseEvent, QAction, QColor, QDesktopServices, QIcon, QPainter, QPen,
@@ -41,7 +42,6 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QTextEdit, QTextBrowser, QStackedWidget,
     QMenu, QToolButton, QRubberBand, QVBoxLayout, QWidget
 )
-from PySide6.QtCore import QVariantAnimation
 
 try:
     from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
@@ -94,7 +94,7 @@ MODULES: dict[str, str | None] = {
     "Mapa orbital": "internal",
     "Notas de prensa": "internal",
     "Lista de satélites": "internal",
-    "Programación": "internal",  # cambiado a internal para conectar los stubs
+    "Programación": "internal",
     "Centro de mando": "internal",
     "Personal": "internal",
 }
@@ -213,13 +213,7 @@ DEFAULT_SATELLITE_GROUPS = {
 SATELLITE_GROUP_LUNAR    = "SATÉLITES LUNARES"
 SATELLITE_GROUP_EXTERNAL = "EXTERNO"
 
-# Nombres (normalizados en minúsculas) que identifican a la Luna como cuerpo
-# orbitado. Cubre KSP estándar ("Mun"), Real Solar System ("Moon") y guardados
-# traducidos ("Luna"). Añade aquí otras variantes si tu partida usa otro nombre.
 LUNAR_BODY_NAMES = {"mun", "moon", "luna"}
-
-# Nombres (normalizados en minúsculas) del planeta principal (Kerbin/Earth).
-# Cualquier cuerpo que NO sea Kerbin ni lunar recibirá el grupo EXTERNO.
 KERBIN_BODY_NAMES = {"kerbin", "earth"}
 
 
@@ -232,7 +226,6 @@ def _is_kerbin_body(body_name: str) -> bool:
 
 
 def apply_shadow(widget: QWidget, blur: int = 28, alpha: int = 90) -> None:
-    # Se elimina el efecto de sombreado (remarcado oscuro) para dejar la interfaz plana
     pass
 
 
@@ -341,11 +334,7 @@ class AuthManager:
 
 
 class KrpcConfigManager:
-    """Persistence layer for the kRPC IP address and port used across the app.
-
-    The values are stored in config/config.json and default to 127.0.0.1:50000
-    when the file doesn't exist yet or contains invalid data.
-    """
+    """Persistence layer for the kRPC IP address and port used across the app."""
 
     def __init__(self, config_file: Path = CONFIG_FILE):
         self.config_file = config_file
@@ -387,8 +376,7 @@ class KrpcConfigManager:
 
 
 class KrpcSettingsDialog(QDialog):
-    """Modal dialog (accessible from the login screen's gear icon) to edit
-    the kRPC IP address and port used for every connection to KSP."""
+    """Modal dialog to edit the kRPC IP address and port used for every connection to KSP."""
 
     def __init__(self, config_manager: "KrpcConfigManager | None" = None, parent: QWidget | None = None):
         super().__init__(parent)
@@ -658,9 +646,7 @@ class ModuleCard(QWidget):
         self.setObjectName("moduleCard" if available else "moduleCardDisabled")
         self.setCursor(Qt.CursorShape.PointingHandCursor if available else Qt.CursorShape.ArrowCursor)
         
-        # 1. TAMAÑO FIJO ABSOLUTO: Bloquea las dimensiones de la card a 330x330 px
         self.setFixedSize(330, 330)
-        
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
         self.setMouseTracking(True)
@@ -669,7 +655,6 @@ class ModuleCard(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # 2. DISTRIBUCIÓN INTERNA INTERNA FIJA (Ejemplo: 230px imagen + 100px texto = 330px total)
         self.image_panel = ModuleCardImagePanel(self._load_pixmap())
         self.image_panel.setObjectName("moduleCardImagePanel")
         self.image_panel.setFixedHeight(230) 
@@ -696,8 +681,6 @@ class ModuleCard(QWidget):
         text_layout.addWidget(self.subtitle_label)
         text_layout.addStretch()
         root.addWidget(self.text_panel)
-
-    # Nota: Ya NO necesitas el método resizeEvent(), puedes borrarlo si lo habías añadido.
 
     def _subtitle_text(self) -> str:
         if self.available:
@@ -1085,18 +1068,20 @@ def _active_ksp_save_context() -> dict | None:
     }
 
 
-def _color_to_hex(color: QColor | tuple[int, int, int]) -> str:
+def _color_to_hex(color: QColor | tuple[int, int, int] | str) -> str:
+    if isinstance(color, str):
+        return color
     if isinstance(color, QColor):
         return color.name()
     return "#{:02x}{:02x}{:02x}".format(*color)
 
 
-def _make_icon_pixmap(kind: str, size: int = 18, color: QColor | tuple[int, int, int] = QColor("#f0f5fb")) -> QPixmap:
+def _make_icon_pixmap(kind: str, size: int = 18, color_val: str = "#f0f5fb") -> QPixmap:
     pix = QPixmap(size, size)
     pix.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pix)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    pen = QPen(QColor(_color_to_hex(color)))
+    pen = QPen(QColor(_color_to_hex(color_val)))
     pen.setWidthF(max(1.4, size / 12))
     pen.setCapStyle(Qt.PenCapStyle.RoundCap)
     pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
@@ -1391,7 +1376,6 @@ class PressStore:
 
     def _prune_unused_media(self) -> None:
         referenced = self._iter_media_paths()
-        # Buscar todas las carpetas tipo "nota_*" en PRESS_DIR
         for item in PRESS_DIR.glob("nota_*"):
             if not item.is_dir():
                 continue
@@ -1401,13 +1385,11 @@ class PressStore:
                         file_path.unlink()
                     except Exception:
                         pass
-            # Si después de limpiar la carpeta queda vacía, la eliminamos
             try:
                 if not any(item.iterdir()):
                     item.rmdir()
             except Exception:
                 pass
-        # También podar el antiguo directorio global de media si existe
         if PRESS_MEDIA_DIR.exists():
             for file_path in PRESS_MEDIA_DIR.rglob("*"):
                 if file_path.is_file() and file_path.resolve() not in referenced:
@@ -1415,7 +1397,6 @@ class PressStore:
                         file_path.unlink()
                     except Exception:
                         pass
-            # Intentar limpiar carpetas vacías del antiguo media
             for sub in (PRESS_MEDIA_IMAGES_DIR, PRESS_MEDIA_VIDEOS_DIR, PRESS_MEDIA_DOCUMENTS_DIR, PRESS_MEDIA_DIR):
                 try:
                     if sub.exists() and not any(sub.iterdir()):
@@ -1554,15 +1535,16 @@ class SatelliteStore:
                     continue
                 if self._orbit_similarity_score(existing, record) > 4.0:
                     continue
-                preferred = existing
+                
                 if int(record.get("id", 0)) > int(existing.get("id", 0)):
-                    preferred = record
                     removed_ids.add(int(existing.get("id", 0)))
-                    kept[kept.index(existing)] = record
+                    idx = kept.index(existing)
+                    kept[idx] = record
+                    record["status"] = record.get("status", SATELLITE_STATUS_ACTIVE)
                 else:
                     removed_ids.add(int(record.get("id", 0)))
-                if preferred is record:
-                    preferred["status"] = preferred.get("status", SATELLITE_STATUS_ACTIVE)
+                    existing["status"] = existing.get("status", SATELLITE_STATUS_ACTIVE)
+                    
                 merged = True
                 changed = True
                 break
@@ -1583,13 +1565,6 @@ class SatelliteStore:
         return []
 
     def _groups_for_orbit_body(self, body_name: str) -> list[str]:
-        """Devuelve los grupos automáticos derivados del cuerpo orbitado.
-
-        - Lunar   → [SATELLITE_GROUP_LUNAR]
-        - Kerbin  → [] (los grupos de altitud (LEO/MEO…) ya se añaden aparte)
-        - Vacío   → [] (cuerpo desconocido, no se añade EXTERNO sin certeza)
-        - Otro    → [SATELLITE_GROUP_EXTERNAL]
-        """
         if not body_name:
             return []
         if _is_lunar_body(body_name):
@@ -1719,9 +1694,7 @@ class SatelliteStore:
                 groups_auto = [_auto_group_for_altitude(float(orbit.get("apoapsis_km", 0) or 0))]
                 groups_auto += _lunar_grp
             else:
-                # Re-evaluar siempre los grupos por cuerpo (lunar y externo) aunque groups_auto ya esté poblado
-                groups_auto = [g for g in groups_auto
-                               if g not in (SATELLITE_GROUP_LUNAR, SATELLITE_GROUP_EXTERNAL)]
+                groups_auto = [g for g in groups_auto if g not in (SATELLITE_GROUP_LUNAR, SATELLITE_GROUP_EXTERNAL)]
                 groups_auto += _lunar_grp
             if not groups_manual and legacy_group and legacy_group not in DEFAULT_SATELLITE_GROUPS:
                 groups_manual = [legacy_group]
@@ -1738,7 +1711,6 @@ class SatelliteStore:
                 record["ksp_identity_key"] = self._satellite_key(record.get("name", ""), record.get("launch_ut"), orbit)
             max_id = max(max_id, int(record["id"]))
 
-            # Comparar campos clave para detectar cambios
             for k in ["game_uid", "ksp_identity_key", "status", "status_mode", "groups_auto", "groups_manual", "groups", "group", "group_manual"]:
                 if record.get(k) != old_record.get(k):
                     changed = True
@@ -2054,7 +2026,7 @@ class SatelliteStore:
                     record["groups_auto"] = default_groups
                     changed = True
                 record["ksp_identity_key"] = key
-                if previous_key and previous_key != key:
+                if 'previous_key' in locals() and previous_key and previous_key != key:
                     records_by_key.pop(previous_key, None)
                 records_by_key[key] = record
                 self._sync_group_fields(record)
